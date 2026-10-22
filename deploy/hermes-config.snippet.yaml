@@ -1,0 +1,15 @@
+# To merge into ~/.hermes/config.yaml (under the existing "mcp_servers:" key if there is one).
+# HERMES_NGROK_MCP_TOKEN is written to ~/.hermes/.env by: sudo deploy/install.sh --hermes-user <user>
+# The port must match HERMES_NGROK_PORT in /etc/hermes-ngrok-mcp/hermes-ngrok-mcp.env.
+# Tools are exposed to the agent as mcp_ngrok_<tool>, e.g. mcp_ngrok_tunnel_open.
+mcp_servers:
+  ngrok:
+    url: "http://127.0.0.1:8765/mcp"
+    headers:
+      Authorization: "Bearer ${HERMES_NGROK_MCP_TOKEN}"
+    # Opening a tunnel includes an end-to-end check through the Internet.
+    timeout: 120
+    connect_timeout: 30
+    # This server never asks Hermes for LLM completions.
+    sampling:
+      enabled: false
