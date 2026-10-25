@@ -11,7 +11,10 @@
 #     generates the API token shared with Hermes; existing settings are never overwritten;
 #   * with --hermes-user, writes HERMES_NGROK_MCP_TOKEN into that user's ~/.hermes/.env and
 #     pre-fills the Telegram settings from it when they are empty;
-#   * installs and (re)starts the systemd unit, then checks that the service answers.
+#   * installs and (re)starts the systemd unit, then checks that the service answers;
+#   * with --nas-dir, also installs the NAS file manager: system user "hermes-nas", shared
+#     folder permissions (owner + hermes-nas, through ACLs), /etc/hermes-nas/hermes-nas.env,
+#     the access key shared with the MCP server, and the socket-activated hermes-nas units.
 set -Eeuo pipefail
 
 readonly APP=hermes-ngrok-mcp
@@ -23,10 +26,16 @@ readonly STATE_DIR=/var/lib/hermes-ngrok-mcp
 readonly UNIT_FILE=/etc/systemd/system/hermes-ngrok-mcp.service
 readonly ADMIN_BIN=/usr/local/bin/hermes-ngrok-admin
 readonly UV_HINT="curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin sh"
+readonly NAS_USER=hermes-nas
+readonly NAS_CONFIG_DIR=/etc/hermes-nas
+readonly NAS_ENV_FILE=$NAS_CONFIG_DIR/hermes-nas.env
+readonly NAS_UNIT_DIR=/etc/systemd/system
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly SRC_DIR
 
 HERMES_USER=""
+NAS_DIR=""
+NAS_OWNER=""
 START=1
 UV_BIN="${UV_BIN:-}"
 
@@ -38,6 +47,9 @@ Usage: sudo $0 [--hermes-user USER] [--uv PATH] [--no-start]
                       and provides the Telegram settings when they are not configured yet.
   --uv PATH           uv executable to use (default: auto-detect).
   --no-start          install without (re)starting the service.
+  --nas-dir DIR       install the NAS file manager serving DIR (e.g. /var/MonNAS). Once installed,
+                      later runs keep it without this option.
+  --nas-owner USER    human user who keeps full access to DIR (default: its current owner).
 EOF
 }
 
@@ -64,6 +76,16 @@ while [[ $# -gt 0 ]]; do
             START=0
             shift
             ;;
+        --nas-dir)
+            [[ $# -ge 2 ]] || die "--nas-dir needs a value"
+            NAS_DIR="$2"
+            shift 2
+            ;;
+        --nas-owner)
+            [[ $# -ge 2 ]] || die "--nas-owner needs a value"
+            NAS_OWNER="$2"
+            shift 2
+            ;;
         -h | --help)
             usage
             exit 0
@@ -78,6 +100,41 @@ done
 [[ $EUID -eq 0 ]] || die "run this script as root (sudo $0 ...)"
 command -v systemctl >/dev/null || die "systemd is required"
 [[ -f $SRC_DIR/pyproject.toml && -f $SRC_DIR/uv.lock ]] || die "run this script from a checkout of the repository"
+
+# --- NAS options -------------------------------------------------------------------------------------
+if [[ -z $NAS_DIR && -f $NAS_ENV_FILE ]]; then
+    NAS_DIR="$(grep -E '^HERMES_NAS_ROOT=' "$NAS_ENV_FILE" | tail -n 1 | cut -d= -f2- || true)"
+fi
+if [[ -n $NAS_DIR ]]; then
+    NAS_DIR="${NAS_DIR%/}"
+    # The path ends up in a systemd unit and in setfacl/find calls: keep it simple and explicit.
+    [[ $NAS_DIR =~ ^/[A-Za-z0-9._/-]+$ ]] ||
+        die "--nas-dir must be an absolute path made of letters, digits, '.', '_', '-' and '/'"
+    [[ $NAS_DIR != *..* ]] || die "--nas-dir cannot contain '..'"
+    case "$NAS_DIR/" in
+        /bin/* | /boot/* | /dev/* | /etc/* | /lib/* | /lib64/* | /opt/hermes-ngrok-mcp/* | /proc/* | /root/* | \
+            /run/* | /sbin/* | /sys/* | /usr/* | /var/lib/hermes-ngrok-mcp/* | /var/lib/hermes-nas/* | /var/lib/docker/*)
+            die "refusing to serve the system directory $NAS_DIR as a NAS"
+            ;;
+        /home/*)
+            die "the NAS service cannot see /home (ProtectHome=yes): choose a folder such as /srv/nas or /var/MonNAS"
+            ;;
+        /var/ | /srv/ | /mnt/ | /media/ | /opt/ | /tmp/ | /var/tmp/)
+            die "choose a dedicated folder inside $NAS_DIR, not $NAS_DIR itself"
+            ;;
+    esac
+    command -v setfacl >/dev/null || die "setfacl is required for the NAS permissions: sudo apt install acl"
+    if [[ -z $NAS_OWNER ]]; then
+        [[ -d $NAS_DIR ]] || die "--nas-owner is required when $NAS_DIR does not exist yet"
+        NAS_OWNER="$(stat -c %U "$NAS_DIR")"
+    fi
+    id -u "$NAS_OWNER" >/dev/null 2>&1 || die "unknown user: $NAS_OWNER"
+    [[ $NAS_OWNER != "$NAS_USER" && $NAS_OWNER != root ]] ||
+        die "--nas-owner must be a human account (e.g. --nas-owner $(logname 2>/dev/null || echo USER))"
+    if [[ -n $HERMES_USER && $NAS_OWNER == "$HERMES_USER" ]]; then
+        warn "the NAS owner is the agent's account: Hermes could then read the NAS without any MFA code"
+    fi
+fi
 
 HERMES_HOME=""
 if [[ -n $HERMES_USER ]]; then
@@ -240,12 +297,81 @@ if [[ -n $HERMES_HOME ]]; then
     echo "    HERMES_NGROK_MCP_TOKEN written"
 fi
 
+# --- 3b. NAS file manager ------------------------------------------------------------------------------------
+if [[ -n $NAS_DIR ]]; then
+    log "NAS file manager for $NAS_DIR"
+    if id -u "$NAS_USER" >/dev/null 2>&1; then
+        echo "    $NAS_USER already exists"
+    else
+        nologin="$(command -v nologin || echo /usr/sbin/nologin)"
+        useradd --system --user-group --no-create-home --home-dir /var/lib/hermes-nas --shell "$nologin" \
+            --comment "hermes-nas file manager" "$NAS_USER"
+        echo "    created $NAS_USER"
+    fi
+
+    first_setup=1
+    if [[ -d $NAS_DIR ]] && getfacl -p "$NAS_DIR" 2>/dev/null | grep -q "^default:group:$NAS_USER:"; then
+        first_setup=0
+    fi
+    install -d -m 2770 -o "$NAS_OWNER" -g "$NAS_USER" "$NAS_DIR"
+    chown "$NAS_OWNER:$NAS_USER" "$NAS_DIR"
+    chmod 2770 "$NAS_DIR"
+    acl="u:$NAS_OWNER:rwX,g:$NAS_USER:rwX"
+    default_acl="d:u::rwX,d:g::rwX,d:o::---,d:u:$NAS_OWNER:rwX,d:g:$NAS_USER:rwX"
+    if [[ $first_setup -eq 1 ]]; then
+        # Existing content: give both parties access once (symbolic links are never followed).
+        setfacl -R -P -m "$acl" "$NAS_DIR"
+        find "$NAS_DIR" -xdev -type d -exec chmod g+s {} + -exec setfacl -m "$default_acl" {} +
+        echo "    permissions set: $NAS_OWNER and $NAS_USER have full access, other users none"
+    else
+        setfacl -m "$acl,$default_acl" "$NAS_DIR"
+        echo "    keeping the existing permissions"
+    fi
+
+    install -d -m 0750 -o root -g "$NAS_USER" "$NAS_CONFIG_DIR"
+    if [[ ! -f $NAS_ENV_FILE ]]; then
+        install -m 0640 -o root -g "$NAS_USER" "$SRC_DIR/deploy/hermes-nas.env.example" "$NAS_ENV_FILE"
+        echo "    created $NAS_ENV_FILE"
+    fi
+    chown root:"$NAS_USER" "$NAS_ENV_FILE"
+    chmod 0640 "$NAS_ENV_FILE"
+    env_set "$NAS_ENV_FILE" HERMES_NAS_ROOT "$NAS_DIR"
+
+    nas_port="$(env_get "$NAS_ENV_FILE" HERMES_NAS_PORT)"
+    nas_port="${nas_port:-8766}"
+    [[ $nas_port =~ ^[0-9]+$ && $nas_port -ge 1 && $nas_port -le 65535 ]] || die "invalid HERMES_NAS_PORT: $nas_port"
+    env_set "$NAS_ENV_FILE" HERMES_NAS_PORT "$nas_port"
+    env_set "$ENV_FILE" HERMES_NGROK_NAS_PORT "$nas_port"
+
+    # The same key on both sides; ngrok injects it into authenticated requests only.
+    nas_key="$(env_get "$NAS_ENV_FILE" HERMES_NAS_ACCESS_KEY)"
+    [[ -n $nas_key ]] || nas_key="$(env_get "$ENV_FILE" HERMES_NGROK_NAS_ACCESS_KEY)"
+    if [[ -z $nas_key ]]; then
+        nas_key="$("$PREFIX/venv/bin/hermes-ngrok-mcp" token)"
+        echo "    generated the NAS access key"
+    fi
+    env_set "$NAS_ENV_FILE" HERMES_NAS_ACCESS_KEY "$nas_key"
+    env_set "$ENV_FILE" HERMES_NGROK_NAS_ACCESS_KEY "$nas_key"
+    timezone="$(env_get "$ENV_FILE" HERMES_NGROK_TIMEZONE)"
+    if [[ -n $timezone ]]; then
+        env_set "$NAS_ENV_FILE" HERMES_NAS_TIMEZONE "$timezone"
+    fi
+fi
+
 # --- 4. systemd ---------------------------------------------------------------------------------------------
 log "systemd unit"
 install -m 0644 -o root -g root "$SRC_DIR/deploy/hermes-ngrok-mcp.service" "$UNIT_FILE"
 install -m 0755 -o root -g root "$SRC_DIR/deploy/hermes-ngrok-admin" "$ADMIN_BIN"
+if [[ -n $NAS_DIR ]]; then
+    sed "s|@NAS_PORT@|$nas_port|g" "$SRC_DIR/deploy/hermes-nas.socket" >"$NAS_UNIT_DIR/hermes-nas.socket"
+    sed "s|@NAS_ROOT@|$NAS_DIR|g" "$SRC_DIR/deploy/hermes-nas.service" >"$NAS_UNIT_DIR/hermes-nas.service"
+    chmod 0644 "$NAS_UNIT_DIR/hermes-nas.socket" "$NAS_UNIT_DIR/hermes-nas.service"
+fi
 systemctl daemon-reload
 systemctl enable --quiet "$APP.service"
+if [[ -n $NAS_DIR ]]; then
+    systemctl enable --quiet hermes-nas.socket
+fi
 
 port="$(env_get "$ENV_FILE" HERMES_NGROK_PORT)"
 port="${port:-8765}"
@@ -266,10 +392,26 @@ sys.exit(urllib.request.urlopen('http://127.0.0.1:$port/healthz', timeout=1).sta
         journalctl -u "$APP.service" -n 40 --no-pager >&2 || true
         die "the service did not become healthy; see the log above"
     fi
+    if [[ -n $NAS_DIR ]]; then
+        # New code or settings: stop the running instance; the socket starts a fresh one on demand.
+        systemctl stop hermes-nas.service
+        systemctl restart hermes-nas.socket
+        if NAS_KEY="$nas_key" "$PREFIX/venv/bin/python" -c "import os, sys, urllib.request
+request = urllib.request.Request('http://127.0.0.1:$nas_port/api/health', headers={'X-Hermes-NAS-Key': os.environ['NAS_KEY']})
+sys.exit(urllib.request.urlopen(request, timeout=20).status != 200)" 2>/dev/null; then
+            echo "    hermes-nas answers on 127.0.0.1:$nas_port (socket-activated)"
+        else
+            journalctl -u hermes-nas.service -n 40 --no-pager >&2 || true
+            die "the NAS did not answer; see the log above"
+        fi
+    fi
 fi
 
 # --- 5. next steps ---------------------------------------------------------------------------------------------
 "$ADMIN_BIN" check || true
+if [[ -n $NAS_DIR ]]; then
+    "$ADMIN_BIN" nas check || true
+fi
 cat <<EOF
 
 Installed $version.
@@ -303,4 +445,11 @@ cat <<EOF
   3. Ask Hermes on Telegram to set up MFA ("configure le MFA pour les tunnels").
 
 Administration: sudo hermes-ngrok-admin --help   |   Logs: journalctl -u $APP -f
+Audit trail:    sudo hermes-ngrok-admin audit --since 24h
 EOF
+if [[ -n $NAS_DIR ]]; then
+    cat <<EOF
+NAS:            $NAS_DIR, opened by Hermes with "nas_open" (one MFA code)
+                sudo hermes-ngrok-admin nas audit --since 24h   |   journalctl -u hermes-nas -f
+EOF
+fi

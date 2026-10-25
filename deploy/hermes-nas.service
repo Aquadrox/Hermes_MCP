@@ -1,0 +1,53 @@
+[Unit]
+Description=Hermes NAS file manager (local only, exposed through an MFA-gated ngrok tunnel)
+Documentation=https://github.com/Aquadrox/Hermes_MCP
+Requires=hermes-nas.socket
+After=hermes-nas.socket
+
+[Service]
+Type=exec
+User=hermes-nas
+Group=hermes-nas
+EnvironmentFile=/etc/hermes-nas/hermes-nas.env
+# Socket-activated: started by the first connection, exits by itself after HERMES_NAS_IDLE_EXIT.
+ExecStart=/opt/hermes-ngrok-mcp/venv/bin/hermes-nas serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+
+# Audit trail: /var/lib/hermes-nas, readable by the service user only.
+StateDirectory=hermes-nas
+StateDirectoryMode=0700
+# Group-writable files: the NAS owner and hermes-nas share the folder (default ACLs set by the installer).
+UMask=0007
+
+# --- Sandboxing (check with: systemd-analyze security hermes-nas) ---
+# The only writable path is the NAS folder (@NAS_ROOT@ is replaced by the installer).
+ProtectSystem=strict
+ReadWritePaths=@NAS_ROOT@
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# No network at all: the listening socket is handed over by systemd (hermes-nas.socket).
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM

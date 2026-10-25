@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
-from collections.abc import Callable, Iterator
+import time
+from collections.abc import Awaitable, Callable, Iterator
 from datetime import datetime
-from typing import Annotated, Any, Literal, TypeVar
+from typing import Annotated, Any, Literal, ParamSpec, TypeVar
 
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -15,14 +17,21 @@ from mcp_types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from hermes_ngrok_mcp import __version__
-from hermes_ngrok_mcp.durations import format_duration
+from hermes_ngrok_mcp.audit import AuditLog, summarize
+from hermes_ngrok_mcp.durations import format_duration, parse_duration
 from hermes_ngrok_mcp.mfa import Enrollment, MfaError, MfaLockedError
+from hermes_ngrok_mcp.nas.client import NasHealth, probe_nas
 from hermes_ngrok_mcp.services import Services
 from hermes_ngrok_mcp.tunnels.manager import TunnelError, TunnelView
 
 log = logging.getLogger(__name__)
 
 T = TypeVar("T")
+P = ParamSpec("P")
+
+# Tool arguments never written to the audit trail.
+_SECRET_ARGUMENTS = frozenset({"mfa_code", "current_mfa_code"})
+_MAX_AUDIT_WINDOW = 90 * 86_400
 
 MfaCode = Annotated[
     str,
@@ -72,6 +81,8 @@ class UsageOut(BaseModel):
     bytes_in: int
     bytes_out: int
     last_activity_at: str | None
+    distinct_client_ips: int = Field(description="Distinct Internet client addresses seen (PROXY protocol).")
+    last_client_ip: str | None
 
 
 class VerificationOut(BaseModel):
@@ -82,6 +93,7 @@ class VerificationOut(BaseModel):
 
 class TunnelOut(BaseModel):
     tunnel_id: str
+    kind: Literal["generic", "nas"] = Field(description="'nas' for the NAS file manager opened by nas_open.")
     protocol: Literal["http", "tcp"]
     local_port: int
     label: str | None
@@ -133,6 +145,58 @@ class TunnelCloseOut(BaseModel):
     message: str
 
 
+class NasStatusOut(BaseModel):
+    enabled: bool = Field(
+        description="False until the administrator installs the NAS (install.sh --nas-dir)."
+    )
+    reachable: bool
+    detail: str
+    root: str | None
+    writable: bool | None
+    disk_total_bytes: int | None
+    disk_free_bytes: int | None
+    tunnel: TunnelOut | None = Field(description="The open NAS tunnel, if any.")
+    message: str
+
+
+class AuditEventOut(BaseModel):
+    time: str
+    event: str = Field(description="e.g. tunnel.opened, tunnel.closed, connection.closed, mfa.rejected.")
+    details: dict[str, Any]
+
+
+class SourceCountOut(BaseModel):
+    ip: str
+    count: int
+
+
+class AuditSummaryOut(BaseModel):
+    events: int
+    tunnels_opened: int
+    tunnels_closed: int
+    tunnel_open_failures: int
+    mfa_successes: int
+    mfa_failures: int
+    mfa_lockouts: int
+    mcp_tool_calls: int
+    mcp_tool_errors: int
+    mcp_auth_rejections: int
+    client_connections: int
+    top_client_ips: list[SourceCountOut]
+
+
+class AuditLogOut(BaseModel):
+    since: str | None
+    category: str
+    returned: int
+    truncated: bool = Field(description="True when older matching events were left out (raise limit).")
+    events: list[AuditEventOut]
+    summary: AuditSummaryOut = Field(
+        description="Counters over every matching event, not only those returned."
+    )
+    message: str
+
+
 def _instructions(services: Services) -> str:
     s = services.settings
     lifetime = format_duration(s.max_lifetime) if s.max_lifetime else "no limit"
@@ -152,6 +216,9 @@ Rules you must follow:
 - The server sends access details, warnings and closing notices to the user on Telegram itself.
   Never ask the user to send you a password that was delivered to them that way.
 - Closing a tunnel (tunnel_close) needs no code. Offer to close tunnels that are no longer needed.
+- The NAS file manager (browse, upload, download, new folder) is opened with nas_open and one MFA code;
+  it is a regular tunnel afterwards (tunnel_status / tunnel_extend / tunnel_close). nas_status needs no code.
+- audit_log reports what happened (tunnels opened/closed, client IPs, MFA attempts, tool calls).
 """
 
 
@@ -182,6 +249,7 @@ def _tunnel_out(services: Services, view: TunnelView) -> TunnelOut:
     verification = view.verification
     return TunnelOut(
         tunnel_id=view.id,
+        kind=view.kind,
         protocol=view.protocol,
         local_port=view.local_port,
         label=view.label,
@@ -201,6 +269,8 @@ def _tunnel_out(services: Services, view: TunnelView) -> TunnelOut:
             bytes_in=usage.bytes_in,
             bytes_out=usage.bytes_out,
             last_activity_at=_iso(services, usage.last_activity_wall),
+            distinct_client_ips=usage.distinct_sources,
+            last_client_ip=usage.last_source,
         ),
         verification=(
             VerificationOut(
@@ -213,12 +283,60 @@ def _tunnel_out(services: Services, view: TunnelView) -> TunnelOut:
     )
 
 
+def audited(audit: AuditLog) -> Callable[[Callable[P, Awaitable[T]]], Callable[P, Awaitable[T]]]:
+    """Record every call of a tool (outcome, duration, non-secret arguments) in the audit trail.
+
+    Unexpected exceptions are logged with their traceback and turned into a clean tool error,
+    so the agent always gets an ``isError`` result instead of a broken session.
+    """
+
+    def decorate(function: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
+        name = function.__name__
+
+        @functools.wraps(function)
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+            started = time.monotonic()
+            arguments = {k: v for k, v in kwargs.items() if k not in _SECRET_ARGUMENTS}
+            codes = sorted(k for k, v in kwargs.items() if k in _SECRET_ARGUMENTS and v is not None)
+
+            def record(outcome: str, error: str | None = None) -> None:
+                audit.record(
+                    "mcp.tool_call",
+                    tool=name,
+                    outcome=outcome,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    arguments=arguments or None,
+                    mfa_code_provided=codes or None,
+                    error=error,
+                )
+
+            try:
+                result = await function(*args, **kwargs)
+            except ToolError as exc:
+                record("error", str(exc)[:500])
+                raise
+            except Exception as exc:
+                log.exception("tool %s failed unexpectedly", name)
+                record("crash", type(exc).__name__)
+                raise ToolError(
+                    f"Internal error in {name}. Nothing was exposed; the administrator can find the details "
+                    "with 'sudo journalctl -u hermes-ngrok-mcp'."
+                ) from exc
+            record("ok")
+            return result
+
+        return wrapper
+
+    return decorate
+
+
 def build_server(services: Services) -> MCPServer:  # noqa: PLR0915 - registers every tool
     settings = services.settings
     mfa = services.mfa
     tunnels = services.tunnels
     notifier = services.notifier
     messages = services.messages
+    audit = audited(services.audit)
 
     server = MCPServer(
         name="hermes-ngrok",
@@ -253,6 +371,7 @@ def build_server(services: Services) -> MCPServer:  # noqa: PLR0915 - registers 
         title="MFA status",
         annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hint=False),
     )
+    @audit
     async def mfa_status() -> MfaStatusOut:
         """Report whether the TOTP second factor is configured, locked or being enrolled."""
         status = mfa.status()
@@ -279,6 +398,7 @@ def build_server(services: Services) -> MCPServer:  # noqa: PLR0915 - registers 
         structured_output=False,
         annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False),
     )
+    @audit
     async def mfa_setup_start(
         current_mfa_code: Annotated[
             str | None,
@@ -355,6 +475,7 @@ def build_server(services: Services) -> MCPServer:  # noqa: PLR0915 - registers 
         title="Confirm MFA enrollment",
         annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False),
     )
+    @audit
     async def mfa_setup_confirm(mfa_code: MfaCode) -> MfaConfirmOut:
         """Finish the MFA enrollment started by mfa_setup_start with a code from the new authenticator."""
         rotation = mfa.is_configured()
@@ -376,6 +497,7 @@ def build_server(services: Services) -> MCPServer:  # noqa: PLR0915 - registers 
         title="Open a tunnel",
         annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=True),
     )
+    @audit
     async def tunnel_open(
         port: Annotated[int, Field(ge=1, le=65_535, description="Local TCP port of the service to expose.")],
         mfa_code: MfaCode,
@@ -408,7 +530,7 @@ def build_server(services: Services) -> MCPServer:  # noqa: PLR0915 - registers 
         """
         with agent_errors():
             await tunnels.check_open(port, protocol, protect)
-            await alert_on_lockout(lambda: mfa.verify(mfa_code))
+            await alert_on_lockout(lambda: mfa.verify(mfa_code, purpose="tunnel_open"))
             view = await tunnels.open(port, protocol, protect=protect, label=label)
         out = _tunnel_out(services, view)
         if out.access.password_delivery == "telegram":
@@ -427,6 +549,7 @@ def build_server(services: Services) -> MCPServer:  # noqa: PLR0915 - registers 
         title="Tunnel status",
         annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hint=True),
     )
+    @audit
     async def tunnel_status(
         tunnel_id: Annotated[str | None, Field(description="Restrict to one tunnel (default: all).")] = None,
         verify: Annotated[
@@ -460,12 +583,13 @@ def build_server(services: Services) -> MCPServer:  # noqa: PLR0915 - registers 
         title="Extend a tunnel",
         annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False),
     )
+    @audit
     async def tunnel_extend(mfa_code: MfaCode, tunnel_id: TunnelId = None) -> TunnelOpenOut:
         """Push back the expiry of an open tunnel (and reset its idle timer). Requires a fresh MFA code."""
         with agent_errors():
             resolved = tunnels.resolve(tunnel_id)
             tunnels.check_extend(resolved)
-            await alert_on_lockout(lambda: mfa.verify(mfa_code))
+            await alert_on_lockout(lambda: mfa.verify(mfa_code, purpose="tunnel_extend"))
             view = await tunnels.extend(resolved)
         out = _tunnel_out(services, view)
         return TunnelOpenOut(tunnel=out, message=f"Tunnel extended. {out.summary}")
@@ -476,6 +600,7 @@ def build_server(services: Services) -> MCPServer:  # noqa: PLR0915 - registers 
             read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False
         ),
     )
+    @audit
     async def tunnel_close(
         tunnel_id: TunnelId = None,
         close_all: Annotated[bool, Field(description="Close every open tunnel.")] = False,
@@ -491,6 +616,185 @@ def build_server(services: Services) -> MCPServer:  # noqa: PLR0915 - registers 
         ]
         message = f"{len(closed)} tunnel(s) closed." if closed else "No tunnel was open."
         return TunnelCloseOut(closed=closed, message=message)
+
+    # --- NAS ---------------------------------------------------------------------------------------------
+    def nas_key() -> str:
+        if settings.nas_access_key is None:
+            raise ToolError(
+                "The NAS is not installed on this server (the administrator must run install.sh --nas-dir)."
+            )
+        return settings.nas_access_key.get_secret_value()
+
+    async def nas_health() -> NasHealth:
+        return await probe_nas(settings.target_host, settings.nas_port, nas_key())
+
+    def nas_tunnel() -> TunnelView | None:
+        return next((view for view in tunnels.list() if view.kind == "nas"), None)
+
+    @server.tool(
+        title="NAS status",
+        annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hint=False),
+    )
+    @audit
+    async def nas_status() -> NasStatusOut:
+        """Report whether the NAS file manager is installed and running, its free space, and its open tunnel.
+
+        Needs no MFA code. Calling it starts the NAS web app if it was idle (it only listens locally).
+        """
+        if not settings.nas_enabled:
+            return NasStatusOut(
+                enabled=False,
+                reachable=False,
+                detail="not installed",
+                root=None,
+                writable=None,
+                disk_total_bytes=None,
+                disk_free_bytes=None,
+                tunnel=None,
+                message=(
+                    "The NAS is not installed on this server. The administrator must run the installer with "
+                    "--nas-dir (see the README); you cannot do it."
+                ),
+            )
+        health = await nas_health()
+        view = nas_tunnel()
+        if view is not None:
+            message = (
+                f"The NAS is open at {view.public_url}. Use tunnel_extend or tunnel_close with "
+                f"tunnel_id {view.id}."
+            )
+        elif health.reachable:
+            message = "The NAS is ready; nas_open exposes it with an MFA code."
+        else:
+            message = (
+                f"The NAS service is not working: {health.detail}. Ask the administrator to check hermes-nas."
+            )
+        return NasStatusOut(
+            enabled=True,
+            reachable=health.reachable,
+            detail=health.detail,
+            root=health.root,
+            writable=health.writable,
+            disk_total_bytes=health.disk_total,
+            disk_free_bytes=health.disk_free,
+            tunnel=_tunnel_out(services, view) if view else None,
+            message=message,
+        )
+
+    @server.tool(
+        title="Open the NAS",
+        annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=True),
+    )
+    @audit
+    async def nas_open(mfa_code: MfaCode) -> TunnelOpenOut:
+        """Expose the NAS file manager (browse, upload, download, new folder) through a password-protected
+        HTTPS tunnel, verified end to end. Requires a fresh MFA code from the user.
+
+        The URL, username and password go to the user on Telegram. The tunnel then behaves like any other:
+        it closes when unused or expired; use tunnel_extend / tunnel_close with the returned tunnel_id.
+        """
+        nas_key()  # refuses early when the NAS is not installed
+        with agent_errors():
+            health = await nas_health()
+            if not health.reachable:
+                raise TunnelError(
+                    f"The NAS service is not working ({health.detail}), so nothing was opened and no MFA "
+                    "code was used. Ask the administrator to check "
+                    "'systemctl status hermes-nas.socket hermes-nas'."
+                )
+            await tunnels.check_open(settings.nas_port, "http", True, kind="nas")
+            await alert_on_lockout(lambda: mfa.verify(mfa_code, purpose="nas_open"))
+            view = await tunnels.open(
+                settings.nas_port,
+                "http",
+                protect=True,
+                label="NAS",
+                kind="nas",
+            )
+        out = _tunnel_out(services, view)
+        if out.access.password_delivery == "telegram":
+            delivery = (
+                "The URL, username and password were sent to the user on Telegram; do not ask for them."
+            )
+        else:
+            delivery = "Give the user the URL, username and password (send them only to the user)."
+        return TunnelOpenOut(tunnel=out, message=f"NAS open and verified. {delivery} {out.summary}")
+
+    # --- audit -------------------------------------------------------------------------------------------
+    @server.tool(
+        title="Audit log",
+        annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hint=False),
+    )
+    @audit
+    async def audit_log(
+        since: Annotated[
+            str,
+            Field(
+                description="How far back: e.g. '30m', '24h', '7d' (at most 90d). '0' means everything kept.",
+                max_length=16,
+            ),
+        ] = "24h",
+        category: Annotated[
+            Literal["all", "tunnels", "connections", "mfa", "mcp", "service"],
+            Field(
+                description=(
+                    "'tunnels' (opened/closed/extended/failed), 'connections' (each client connection "
+                    "with its IP), 'mfa' (codes accepted/rejected, lockouts), 'mcp' (tool calls, rejected "
+                    "API requests), 'service' (starts/stops) or 'all'."
+                )
+            ),
+        ] = "all",
+        limit: Annotated[int, Field(ge=1, le=500, description="Maximum number of events returned.")] = 50,
+    ) -> AuditLogOut:
+        """Read the server's audit trail: when tunnels were opened and closed, from which client IPs they
+        were used, how many MFA attempts failed, which tools were called. Read-only; needs no MFA code.
+
+        The summary counts every matching event in the window; events lists the most recent ones.
+        """
+        try:
+            window = parse_duration(since)
+        except ValueError as exc:
+            raise ToolError(f"Invalid 'since' {since!r}: use e.g. '30m', '24h' or '7d'.") from exc
+        if window > _MAX_AUDIT_WINDOW:
+            raise ToolError("'since' is limited to 90d.")
+        start = services.clock.time() - window if window else None
+        entries = services.audit.query(since=start, category=category, limit=0)
+        summary = summarize(entries)
+        recent = entries[-limit:]
+        hidden = {"ts", "time", "event"}
+        return AuditLogOut(
+            since=_iso(services, start),
+            category=category,
+            returned=len(recent),
+            truncated=len(entries) > len(recent),
+            events=[
+                AuditEventOut(
+                    time=str(entry.get("time", "")),
+                    event=str(entry.get("event", "")),
+                    details={k: v for k, v in entry.items() if k not in hidden},
+                )
+                for entry in recent
+            ],
+            summary=AuditSummaryOut(
+                events=summary.events,
+                tunnels_opened=summary.tunnels_opened,
+                tunnels_closed=summary.tunnels_closed,
+                tunnel_open_failures=summary.tunnel_open_failures,
+                mfa_successes=summary.mfa_successes,
+                mfa_failures=summary.mfa_failures,
+                mfa_lockouts=summary.mfa_lockouts,
+                mcp_tool_calls=summary.mcp_tool_calls,
+                mcp_tool_errors=summary.mcp_tool_errors,
+                mcp_auth_rejections=summary.mcp_auth_rejections,
+                client_connections=summary.connections,
+                top_client_ips=[SourceCountOut(ip=ip, count=n) for ip, n in summary.top_sources()],
+            ),
+            message=(
+                f"{summary.events} event(s) since {_iso(services, start) or 'the beginning'}; "
+                f"{len(recent)} returned, most recent last. Client IPs come from ngrok (PROXY protocol); "
+                "failed basic-auth attempts are stopped by ngrok and never reach this server."
+            ),
+        )
 
     return server
 

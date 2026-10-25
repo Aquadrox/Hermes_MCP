@@ -119,6 +119,10 @@ class Settings(BaseSettings):
     target_host: str = "127.0.0.1"
     allowed_ports: Ports = PortRanges.parse("1-65535")
     denied_ports: Ports = PortRanges.parse("")
+    proxy_protocol: bool = Field(
+        default=False,
+        description="Ask ngrok for PROXY headers to audit the clients' real addresses (paid ngrok plans).",
+    )
 
     # --- protection of public HTTP endpoints ----------------------------------------------------
     basic_auth: bool = Field(default=True, description="Protect HTTP tunnels with generated basic-auth.")
@@ -136,6 +140,16 @@ class Settings(BaseSettings):
     mfa_lockout: Duration = 900
     mfa_enrollment_ttl: Duration = 600
     mfa_allow_inline_enrollment: bool = True
+
+    # --- NAS file manager (separate hermes-nas service, reached through a tunnel) ---------------------
+    nas_port: int = Field(default=8766, ge=1, le=65_535)
+    nas_access_key: SecretStr | None = Field(
+        default=None, description="Admin key shared with hermes-nas (health, tunnel credentials)."
+    )
+
+    # --- audit trail --------------------------------------------------------------------------------
+    audit_max_bytes: int = Field(default=10 * 1024 * 1024, ge=64 * 1024)
+    audit_backups: int = Field(default=5, ge=0, le=100)
 
     # --- MCP server ---------------------------------------------------------------------------
     host: str = "127.0.0.1"
@@ -157,7 +171,7 @@ class Settings(BaseSettings):
     timezone: str = "UTC"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
-    @field_validator("ngrok_authtoken", "api_token", "telegram_bot_token", mode="before")
+    @field_validator("ngrok_authtoken", "api_token", "telegram_bot_token", "nas_access_key", mode="before")
     @classmethod
     def _blank_secret_is_none(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value
@@ -199,6 +213,10 @@ class Settings(BaseSettings):
             raise ValueError("extension must be > 0 when max_lifetime is set")
         if (self.telegram_bot_token is None) != (self.telegram_chat_id is None):
             raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set together")
+        if self.nas_access_key is not None and len(self.nas_access_key.get_secret_value()) < 32:
+            raise ValueError("HERMES_NGROK_NAS_ACCESS_KEY must be at least 32 characters long")
+        if self.nas_port == self.port:
+            raise ValueError("HERMES_NGROK_NAS_PORT must differ from HERMES_NGROK_PORT")
         return self
 
     # --- derived helpers -----------------------------------------------------------------------------
@@ -222,6 +240,14 @@ class Settings(BaseSettings):
     @property
     def mfa_state_file(self) -> Path:
         return self.state_dir / "mfa.json"
+
+    @property
+    def audit_file(self) -> Path:
+        return self.state_dir / "audit.jsonl"
+
+    @property
+    def nas_enabled(self) -> bool:
+        return self.nas_access_key is not None
 
 
 def load_settings(env_file: Path | None = None) -> Settings:

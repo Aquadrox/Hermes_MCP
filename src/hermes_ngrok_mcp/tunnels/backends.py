@@ -22,6 +22,8 @@ _NGROK_HINTS = {
     "108": "another ngrok agent session is already running with this account (free plans allow one)",
     "334": "this endpoint/domain is already online elsewhere (free plans have a single dev domain)",
     "8013": "TCP endpoints require a payment method on the ngrok account, even on the free plan",
+    "9014": "the PROXY protocol needs a paid ngrok plan: set HERMES_NGROK_PROXY_PROTOCOL=false",
+    "2263": "this Traffic Policy uses an action reserved to paid ngrok plans",
 }
 
 
@@ -37,6 +39,7 @@ class EndpointSpec:
     domain: str | None = None
     metadata: str = ""
     description: str = ""
+    proxy_protocol: bool = False
 
 
 class Endpoint(Protocol):
@@ -54,23 +57,15 @@ class TunnelBackend(Protocol):
 
 def basic_auth_policy(username: str, password: str, *, realm: str = "Hermes") -> str:
     """ngrok Traffic Policy enforcing HTTP basic authentication at the ngrok edge."""
-    policy = {
-        "on_http_request": [
-            {
-                "actions": [
-                    {
-                        "type": "basic-auth",
-                        "config": {
-                            "realm": realm,
-                            "credentials": [f"{username}:{password}"],
-                            "enforce": True,
-                        },
-                    }
-                ]
-            }
-        ]
-    }
+    policy = {"on_http_request": [{"actions": [_basic_auth_action(username, password, realm)]}]}
     return json.dumps(policy, separators=(",", ":"))
+
+
+def _basic_auth_action(username: str, password: str, realm: str) -> dict[str, Any]:
+    return {
+        "type": "basic-auth",
+        "config": {"realm": realm, "credentials": [f"{username}:{password}"], "enforce": True},
+    }
 
 
 def describe_ngrok_error(exc: BaseException, *, secrets: tuple[str, ...] = ()) -> str:
@@ -138,6 +133,8 @@ class NgrokBackend:
                     scheme = "tcp"
                 if spec.traffic_policy:
                     builder = builder.traffic_policy(spec.traffic_policy)
+                if spec.proxy_protocol:
+                    builder = builder.proxy_proto("2")
                 if spec.metadata:
                     builder = builder.metadata(spec.metadata)
                 if spec.description:

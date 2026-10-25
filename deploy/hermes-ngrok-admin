@@ -6,11 +6,20 @@
 #   sudo hermes-ngrok-admin mfa setup      enroll Proton Authenticator from the terminal
 #   sudo hermes-ngrok-admin mfa reset      lost phone: forget the current secret
 #   sudo hermes-ngrok-admin notify-test    send a Telegram test message
+#   sudo hermes-ngrok-admin audit [--since 24h] [--category tunnels|connections|mfa|mcp|service]
+#                                          [--summary] [--json]
+#                                          audit trail: tunnels opened/closed, client IPs, MFA attempts
+#   sudo hermes-ngrok-admin nas check      NAS file manager: configuration and folder permissions
+#   sudo hermes-ngrok-admin nas audit [--since 7d] [--summary] [--json]
+#                                          NAS audit trail: uploads, downloads, new folders, refusals
 set -eu
 
 SERVICE_USER=hermes-ngrok
 BIN=/opt/hermes-ngrok-mcp/venv/bin/hermes-ngrok-mcp
 ENV_FILE=/etc/hermes-ngrok-mcp/hermes-ngrok-mcp.env
+NAS_USER=hermes-nas
+NAS_BIN=/opt/hermes-ngrok-mcp/venv/bin/hermes-nas
+NAS_ENV_FILE=/etc/hermes-nas/hermes-nas.env
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "hermes-ngrok-admin must be run as root (sudo hermes-ngrok-admin ...)" >&2
@@ -20,4 +29,15 @@ if [ "$#" -eq 0 ]; then
     set -- --help
 fi
 cd /
+if [ "$1" = "nas" ]; then
+    shift
+    if [ ! -f "$NAS_ENV_FILE" ]; then
+        echo "The NAS is not installed (run install.sh with --nas-dir)." >&2
+        exit 1
+    fi
+    if [ "$#" -eq 0 ]; then
+        set -- --help
+    fi
+    exec runuser -u "$NAS_USER" -- "$NAS_BIN" --env-file "$NAS_ENV_FILE" "$@"
+fi
 exec runuser -u "$SERVICE_USER" -- "$BIN" --env-file "$ENV_FILE" "$@"

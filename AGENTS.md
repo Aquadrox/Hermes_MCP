@@ -1,7 +1,9 @@
 # Instructions for AI agents (Hermes)
 
 This repository is an MCP server that lets you open short-lived ngrok tunnels for your user,
-protected by a TOTP code from their Proton Authenticator app. Read this file before installing
+protected by a TOTP code from their Proton Authenticator app. It also ships an optional NAS
+file manager (separate `hermes-nas` service, reachable only through an MFA-gated tunnel) and an
+audit log. Read this file before installing
 or using it. The user-facing documentation (in French) is in `README.md`.
 
 ## Ground rules
@@ -10,6 +12,8 @@ or using it. The user-facing documentation (in French) is in `README.md`.
   Never run it under your own user, and never try to read or change `/etc/hermes-ngrok-mcp/` or
   `/var/lib/hermes-ngrok-mcp/`: the isolation is what makes the MFA meaningful.
 - Never start `ngrok` yourself and never try to bypass the MFA.
+- Never try to reach the NAS directly (`127.0.0.1:8766`, its folder, `/etc/hermes-nas/`,
+  `/var/lib/hermes-nas/`): the user reaches it through `nas_open` and their MFA code.
 - Never invent, guess, reuse or store an MFA code. Ask the user each time.
 - Installing the service needs root **once**. If you do not have passwordless `sudo`, give the
   user the exact command to run over SSH. If you do have it, tell the user that the isolation
@@ -73,6 +77,22 @@ Then, as yourself:
 6. Verify: call `mcp_ngrok_mfa_status`; a fresh install answers `configured: false`. Then offer
    the user to configure MFA (see the skill).
 
+### Optional: NAS file manager
+
+The user (root) installs it once; give them these commands, adapting the folder and its owner
+(the owner must be the user's own account, never yours):
+
+```bash
+sudo apt install acl
+sudo /usr/local/src/hermes-ngrok-mcp/deploy/install.sh --nas-dir /var/MonNAS --nas-owner <owner>
+sudo hermes-ngrok-admin nas check
+```
+
+The installer creates the `hermes-nas` system user, sets the folder to `<owner>:hermes-nas 2770`
+with default ACLs, generates the access key shared with the MCP server and installs the
+socket-activated `hermes-nas` units. Then call `mcp_ngrok_nas_status`: it answers
+`enabled: true, reachable: true`. Copy the skill again (it documents `nas_open` and `audit_log`).
+
 ## Updating
 
 ```bash
@@ -91,8 +111,12 @@ Updating restarts the service, which closes any open tunnel.
 - `401 unauthorized`: the token in `~/.hermes/.env` differs from `HERMES_NGROK_API_TOKEN` in
   the service configuration. Re-run the installer with `--hermes-user`.
 - Service problems: ask the user for `sudo journalctl -u hermes-ngrok-mcp -n 50`.
+- NAS problems: ask for `systemctl status hermes-nas.socket hermes-nas`,
+  `sudo journalctl -u hermes-nas -n 50` and `sudo hermes-ngrok-admin nas check`.
+- What happened: `mcp_ngrok_audit_log`, or ask the user for `sudo hermes-ngrok-admin audit --since 24h`.
 
 ## Development
 
-`uv sync`, then `make check` (ruff, mypy --strict, pytest). The code is in `src/hermes_ngrok_mcp/`,
-the tests in `tests/`. Keep tool descriptions and `skills/ngrok-tunnels/SKILL.md` consistent.
+`uv sync`, then `make check` (ruff, mypy --strict, pytest). The code is in `src/hermes_ngrok_mcp/`
+(the NAS in `src/hermes_ngrok_mcp/nas/`, its UI in `nas/static/`), the tests in `tests/`. Keep
+tool descriptions and `skills/ngrok-tunnels/SKILL.md` consistent.

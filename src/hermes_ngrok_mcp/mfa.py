@@ -28,6 +28,7 @@ from typing import Any
 import pyotp
 import segno
 
+from hermes_ngrok_mcp.audit import AuditLog
 from hermes_ngrok_mcp.clock import Clock
 from hermes_ngrok_mcp.config import Settings
 from hermes_ngrok_mcp.storage import JsonStateFile
@@ -89,6 +90,16 @@ class MfaLockedError(MfaError):
 
 class MfaEnrollmentError(MfaError):
     pass
+
+
+_REJECTION_REASONS: dict[type[MfaError], str] = {
+    MfaCodeFormatError: "bad_format",
+    MfaInvalidCodeError: "invalid_code",
+    MfaCodeReusedError: "reused_code",
+    MfaLockedError: "locked",
+    MfaNotConfiguredError: "not_configured",
+    MfaEnrollmentError: "no_enrollment",
+}
 
 
 @dataclass(frozen=True)
@@ -158,8 +169,10 @@ class MfaManager:
         failure_window: int = 300,
         lockout: int = 900,
         enrollment_ttl: int = 600,
+        audit: AuditLog | None = None,
     ) -> None:
         self._store = store
+        self._audit = audit
         self._clock = clock
         self.issuer = issuer
         self.account = account
@@ -171,7 +184,7 @@ class MfaManager:
         self._pending: _Pending | None = None
 
     @classmethod
-    def from_settings(cls, settings: Settings, clock: Clock) -> MfaManager:
+    def from_settings(cls, settings: Settings, clock: Clock, audit: AuditLog | None = None) -> MfaManager:
         return cls(
             JsonStateFile(settings.mfa_state_file),
             clock=clock,
@@ -182,6 +195,7 @@ class MfaManager:
             failure_window=settings.mfa_failure_window,
             lockout=settings.mfa_lockout,
             enrollment_ttl=settings.mfa_enrollment_ttl,
+            audit=audit,
         )
 
     # --- queries ------------------------------------------------------------------------------
@@ -219,7 +233,7 @@ class MfaManager:
                     "code (current_code). If the device is lost, an administrator must reset MFA on the "
                     "server with: hermes-ngrok-admin mfa reset"
                 )
-            self.verify(current_code)
+            self.verify(current_code, purpose="mfa_rotation")
         secret = generate_secret()
         expires_at = self._clock.time() + self._enrollment_ttl
         self._pending = _Pending(secret=secret, expires_at=expires_at, rotation=rotation)
@@ -227,6 +241,7 @@ class MfaManager:
             name=self.account, issuer_name=self.issuer
         )
         log.info("MFA enrollment started (rotation=%s)", rotation)
+        self._record("mfa.enrollment_started", rotation=rotation)
         return Enrollment(
             secret=secret,
             uri=uri,
@@ -237,13 +252,19 @@ class MfaManager:
         )
 
     def confirm_enrollment(self, code: str) -> None:
-        normalized = normalize_code(code)
+        try:
+            normalized = normalize_code(code)
+        except MfaError as exc:
+            self._rejected(exc, purpose="mfa_enrollment")
+            raise
         now = self._clock.time()
         pending = self._live_pending(now)
         if pending is None:
-            raise MfaEnrollmentError(
+            missing = MfaEnrollmentError(
                 "No MFA enrollment in progress (or it expired). Start again with mfa_setup_start."
             )
+            self._rejected(missing, purpose="mfa_enrollment")
+            raise missing
         error: MfaError | None = None
         with self._store.transaction() as state:
             error = self._check_lock(state, now)
@@ -274,11 +295,15 @@ class MfaManager:
                     )
         if error is not None:
             log.warning("MFA enrollment confirmation failed: %s", type(error).__name__)
+            self._rejected(error, purpose="mfa_enrollment")
             raise error
         self._pending = None
         log.info("MFA enrollment confirmed (rotation=%s)", pending.rotation)
+        self._record("mfa.enrollment_confirmed", rotation=pending.rotation)
 
     def cancel_enrollment(self) -> None:
+        if self._pending is not None:
+            self._record("mfa.enrollment_cancelled")
         self._pending = None
 
     def reset(self) -> None:
@@ -287,11 +312,19 @@ class MfaManager:
             state.clear()
         self._pending = None
         log.warning("MFA reset: the authenticator must be enrolled again")
+        self._record("mfa.reset")
 
     # --- verification -----------------------------------------------------------------------------
-    def verify(self, code: str) -> None:
-        """Validate a code for the active secret, consuming it. Raises an :class:`MfaError`."""
-        normalized = normalize_code(code)
+    def verify(self, code: str, *, purpose: str | None = None) -> None:
+        """Validate a code for the active secret, consuming it. Raises an :class:`MfaError`.
+
+        ``purpose`` (e.g. ``"tunnel_open"``) is only recorded in the audit trail.
+        """
+        try:
+            normalized = normalize_code(code)
+        except MfaError as exc:
+            self._rejected(exc, purpose=purpose)
+            raise
         now = self._clock.time()
         error: MfaError | None = None
         with self._store.transaction() as state:
@@ -311,10 +344,30 @@ class MfaManager:
                     state["lockouts"] = 0
         if error is not None:
             log.warning("MFA verification refused: %s", type(error).__name__)
+            self._rejected(error, purpose=purpose)
             raise error
         log.info("MFA verification succeeded")
+        self._record("mfa.verified", purpose=purpose)
 
     # --- internals ------------------------------------------------------------------------------------
+    def _record(self, event: str, **fields: object) -> None:
+        if self._audit is not None:
+            self._audit.record(event, **fields)
+
+    def _rejected(self, error: MfaError, *, purpose: str | None) -> None:
+        reason = _REJECTION_REASONS.get(type(error), type(error).__name__)
+        remaining = error.remaining_attempts if isinstance(error, MfaInvalidCodeError) else None
+        retry_after = error.retry_after if isinstance(error, MfaLockedError) else None
+        self._record(
+            "mfa.rejected",
+            purpose=purpose,
+            reason=reason,
+            remaining_attempts=remaining,
+            retry_after=retry_after,
+        )
+        if isinstance(error, MfaLockedError) and error.newly_locked:
+            self._record("mfa.locked", purpose=purpose, duration_seconds=error.retry_after)
+
     def _live_pending(self, now: float) -> _Pending | None:
         if self._pending is not None and now >= self._pending.expires_at:
             self._pending = None

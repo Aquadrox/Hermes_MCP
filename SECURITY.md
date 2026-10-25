@@ -22,7 +22,15 @@ propriétaire doit pouvoir le décider, pour une durée courte, vers un service 
 | Processus local qui appelle le serveur MCP | Jeton Bearer (≥ 32 caractères, comparaison à temps constant) ; protection contre le DNS rebinding (en-tête `Host` vérifié). |
 | Compromission du service | Bac à sable systemd : `NoNewPrivileges`, aucune capability, `ProtectSystem=strict`, `ProtectHome`, filtre d'appels système, familles d'adresses limitées. |
 | Installeur détourné pour exécuter du code en root | L'installeur n'exécute que des binaires `uv` contrôlés par root et avertit si les sources ne le sont pas ; la documentation impose un clone appartenant à root. |
-| Fuite de secrets dans les journaux | Codes, secrets, mots de passe et tokens ne sont jamais journalisés ; le token du bot est masqué dans les erreurs ; les URL de requêtes httpx ne sont pas journalisées. |
+| Fuite de secrets dans les journaux | Codes, secrets, mots de passe et tokens ne sont jamais journalisés ; le token du bot est masqué dans les erreurs ; les URL de requêtes httpx ne sont pas journalisées. Le journal d'audit ne garde que la présence d'un code MFA, jamais sa valeur. |
+| Hermes (ou tout processus local) lit le NAS via 127.0.0.1 sans MFA | Le NAS exige l'identifiant et le mot de passe générés pour le tunnel en cours (24 caractères aléatoires), envoyés uniquement sur Telegram, et révoqués à la fermeture. Sans tunnel NAS ouvert, il refuse tout. La clé d'administration (`/etc/hermes-nas`, `/etc/hermes-ngrok-mcp`, illisibles par l'agent) ne permet que la santé et la remise des identifiants. |
+| Brute-force du mot de passe du NAS | Comparaison à temps constant, empreinte SHA-256 seulement sur disque ; après 20 échecs en 5 min, tout est refusé 15 min ; chaque échec est consigné avec l'IP du client. |
+| Traversée de répertoires, liens symboliques, fichiers spéciaux | Chaque niveau du chemin est ouvert depuis un descripteur de la racine avec `O_NOFOLLOW` ; `..` est refusé ; seuls les fichiers réguliers sont servis ; FIFO ouvertes sans blocage. |
+| Fichier HTML/SVG piégé déposé dans le NAS (XSS) | Téléchargement forcé (`attachment`, `application/octet-stream`), aperçu limité aux images/vidéos/sons/texte brut, CSP `sandbox` et `nosniff` sur tout fichier servi ; l'interface n'insère jamais un nom de fichier comme HTML. |
+| Requête cross-site exploitant la session basic auth (CSRF) | Envoi et création de dossier exigent l'en-tête `X-NAS-Request` (impossible cross-origin sans preflight CORS, jamais accordé) et refusent `Sec-Fetch-Site: cross-site/same-site`. |
+| Écrasement ou perte de fichiers | Le NAS n'écrase ni ne supprime : envoi dans un fichier temporaire puis `link()` atomique vers un nom libre. |
+| Compromission du NAS | Service séparé sous l'utilisateur `hermes-nas`, sans réseau (`PrivateNetwork`, socket transmis par systemd), écriture limitée au dossier partagé, mêmes protections systemd que le serveur MCP ; il ne voit ni le secret MFA ni le token ngrok. |
+| Effacement des traces | Le journal d'audit appartient aux utilisateurs des services (0600) ; l'agent ne peut que le lire via `audit_log`. |
 
 ## Risques résiduels
 
@@ -41,13 +49,23 @@ propriétaire doit pouvoir le décider, pour une durée courte, vers un service 
 - **sudo sans mot de passe pour Hermes** : si l'utilisateur Hermes peut devenir root,
   l'isolation par utilisateur ne tient plus.
 - **Fournisseur** : le trafic transite par ngrok (TLS terminé chez ngrok pour HTTP).
+- **NAS ouvert** : pendant la durée du tunnel, quiconque détient l'URL et le mot de passe peut
+  lire et ajouter des fichiers (sans pouvoir rien supprimer ni écraser). Ferme le tunnel dès que
+  tu as fini.
+- **Tentatives de mot de passe sur la basic auth des tunnels classiques** : ngrok les bloque
+  avant le VPS, elles n'apparaissent donc pas dans le journal d'audit (celles du NAS, si).
+- **IP des clients** : pour les tunnels classiques, elles viennent du PROXY protocol de ngrok,
+  réservé aux plans payants ; sans lui, l'audit indique les connexions sans leur origine.
+- **NAS sans authentification à l'edge ngrok** : sur le plan gratuit, les requêtes non
+  authentifiées atteignent le NAS, qui les refuse avant de lire le moindre fichier.
 
 ## Bonnes pratiques
 
 - Garde l'horloge du VPS synchronisée (NTP) : TOTP en dépend.
 - Supprime les messages contenant un secret s'ils ont été envoyés via l'agent.
-- Vérifie périodiquement `journalctl -u hermes-ngrok-mcp` et
-  `systemd-analyze security hermes-ngrok-mcp`.
+- Vérifie périodiquement `sudo hermes-ngrok-admin audit --summary --since 7d`,
+  `sudo hermes-ngrok-admin nas audit --since 7d` et
+  `systemd-analyze security hermes-ngrok-mcp hermes-nas`.
 - Restreins les ports exposables avec `HERMES_NGROK_ALLOWED_PORTS` si tu n'en utilises que
   quelques-uns.
 

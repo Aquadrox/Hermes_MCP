@@ -7,6 +7,9 @@ plan or API, for HTTP, WebSocket and raw TCP alike.
 Connections accepted while the tunnel is being verified are flagged as probes: they are
 left out of the usage statistics, and their bytes only count once verification is over
 (the ngrok edge may reuse such a connection for real traffic afterwards).
+
+With ``proxy_protocol`` on, each connection starts with a PROXY header from the ngrok edge
+giving the Internet client's address; it is stripped here and reported for auditing.
 """
 
 from __future__ import annotations
@@ -14,11 +17,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator
+from collections import Counter
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from hermes_ngrok_mcp.clock import Clock
+from hermes_ngrok_mcp.tunnels.proxy_protocol import ProxyAddress, read_proxy_header
 
 log = logging.getLogger(__name__)
 
@@ -32,11 +37,29 @@ class UsageStats:
     bytes_in: int
     bytes_out: int
     last_activity_wall: float | None
+    distinct_sources: int = 0
+    last_source: str | None = None
+
+
+@dataclass(frozen=True)
+class ConnectionRecord:
+    """A finished client connection, as reported to the audit trail."""
+
+    source: ProxyAddress | None
+    opened_at: float
+    duration: float
+    bytes_in: int
+    bytes_out: int
 
 
 @dataclass
 class _Connection:
     probe: bool
+    opened_at: float = 0.0
+    opened_mono: float = 0.0
+    source: ProxyAddress | None = None
+    bytes_in: int = 0
+    bytes_out: int = 0
 
 
 class ActivityProxy:
@@ -48,12 +71,18 @@ class ActivityProxy:
         clock: Clock,
         connect_timeout: float = 5.0,
         listen_host: str = "127.0.0.1",
+        proxy_protocol: bool = False,
+        on_connection: Callable[[ConnectionRecord], None] | None = None,
     ) -> None:
         self.target_host = target_host
         self.target_port = target_port
         self._clock = clock
         self._connect_timeout = connect_timeout
         self._listen_host = listen_host
+        self._proxy_protocol = proxy_protocol
+        self._on_connection = on_connection
+        self._sources: Counter[str] = Counter()
+        self._last_source: str | None = None
         self._server: asyncio.Server | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
         self._probe_event: asyncio.Event | None = None
@@ -101,7 +130,13 @@ class ActivityProxy:
             bytes_in=self._bytes_in,
             bytes_out=self._bytes_out,
             last_activity_wall=self._last_activity_wall,
+            distinct_sources=len(self._sources),
+            last_source=self._last_source,
         )
+
+    def sources(self) -> Counter[str]:
+        """Connections per client IP (known only with the PROXY protocol)."""
+        return Counter(self._sources)
 
     @property
     def active_connections(self) -> int:
@@ -142,8 +177,10 @@ class ActivityProxy:
             return
         if inbound:
             self._bytes_in += size
+            connection.bytes_in += size
         else:
             self._bytes_out += size
+            connection.bytes_out += size
         self._touch()
 
     async def _handle(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter) -> None:
@@ -151,7 +188,9 @@ class ActivityProxy:
         if task is not None:
             self._tasks.add(task)
         probe_event = self._probe_event
-        connection = _Connection(probe=probe_event is not None)
+        connection = _Connection(
+            probe=probe_event is not None, opened_at=self._clock.time(), opened_mono=self._clock.monotonic()
+        )
         if probe_event is not None:
             probe_event.set()
         else:
@@ -160,6 +199,12 @@ class ActivityProxy:
             self._touch()
         upstream_writer: asyncio.StreamWriter | None = None
         try:
+            preamble = b""
+            if self._proxy_protocol:
+                connection.source, preamble = await read_proxy_header(client_reader)
+                if connection.source is not None and not connection.probe:
+                    self._sources[connection.source.ip] += 1
+                    self._last_source = connection.source.ip
             try:
                 upstream_reader, upstream = await asyncio.wait_for(
                     asyncio.open_connection(self.target_host, self.target_port), timeout=self._connect_timeout
@@ -170,6 +215,9 @@ class ActivityProxy:
                 )
                 return
             upstream_writer = upstream
+            if preamble:
+                self._count(connection, len(preamble), inbound=True)
+                upstream.write(preamble)
             await self._relay(connection, client_reader, client_writer, upstream_reader, upstream)
         finally:
             for writer in (client_writer, upstream_writer):
@@ -178,8 +226,25 @@ class ActivityProxy:
             if not connection.probe:
                 self._connections_active -= 1
                 self._touch()
+                self._report(connection)
             if task is not None:
                 self._tasks.discard(task)
+
+    def _report(self, connection: _Connection) -> None:
+        if self._on_connection is None:
+            return
+        try:
+            self._on_connection(
+                ConnectionRecord(
+                    source=connection.source,
+                    opened_at=connection.opened_at,
+                    duration=max(0.0, self._clock.monotonic() - connection.opened_mono),
+                    bytes_in=connection.bytes_in,
+                    bytes_out=connection.bytes_out,
+                )
+            )
+        except Exception:
+            log.exception("connection callback failed")
 
     async def _relay(
         self,

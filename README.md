@@ -6,6 +6,10 @@ langage naturel, un tunnel [ngrok](https://ngrok.com) temporaire vers un port lo
 non exposé à Internet. Chaque ouverture est protégée par un **code TOTP** généré par
 **Proton Authenticator** (ou toute application compatible).
 
+Il fournit aussi un **gestionnaire de fichiers NAS** (navigation, envoi, téléchargement, création
+de dossiers) qui n'écoute qu'en local et ne devient accessible qu'à travers un tunnel ouvert
+avec ton code MFA, ainsi qu'un **journal d'audit** de tout ce qui se passe.
+
 ```
 Toi (Telegram) ──► Hermes ──► hermes-ngrok-mcp ──► ngrok ──► https://xxx.ngrok-free.app
    « ouvre-moi un tunnel     (service dédié,            ▲
@@ -38,19 +42,30 @@ Toi (Telegram) ──► Hermes ──► hermes-ngrok-mcp ──► ngrok ─�
 - **HTTP et TCP** (SSH, bases de données…).
 - **Isolation** : service systemd durci, exécuté sous un utilisateur Unix dédié. Hermes ne peut
   lire ni le secret MFA ni le token ngrok.
+- **Gestionnaire de fichiers NAS** (option) : « ouvre le NAS » + un code MFA, et le bot t'envoie
+  l'adresse d'une interface web moderne (mobile, thème sombre, glisser-déposer, aperçus photo,
+  vidéo, audio et texte, reprise des téléchargements). Il tourne dans un service séparé, sans
+  aucun accès réseau, sous son propre utilisateur, et ne peut écrire que dans le dossier partagé.
+  Rien n'est jamais écrasé ni supprimé.
+- **Journal d'audit** : ouvertures, fermetures, prolongations, chaque connexion avec l'**adresse
+  IP réelle** du client, tentatives MFA (réussies, refusées, verrouillages), appels d'outils,
+  requêtes refusées. Consultable par l'administrateur (`hermes-ngrok-admin audit`) et, en
+  lecture seule, par Hermes (« qui s'est connecté au tunnel aujourd'hui ? »).
 
 ## Sommaire
 
 1. [Prérequis](#prérequis)
 2. [Installation](#installation)
-3. [Configurer le MFA avec Proton Authenticator](#configurer-le-mfa-avec-proton-authenticator)
-4. [Utilisation au quotidien](#utilisation-au-quotidien)
-5. [Configuration](#configuration)
-6. [Outils MCP exposés](#outils-mcp-exposés)
-7. [Administration](#administration)
-8. [Dépannage](#dépannage)
-9. [Sécurité](#sécurité)
-10. [Développement](#développement)
+3. [Gestionnaire de fichiers NAS](#gestionnaire-de-fichiers-nas)
+4. [Configurer le MFA avec Proton Authenticator](#configurer-le-mfa-avec-proton-authenticator)
+5. [Utilisation au quotidien](#utilisation-au-quotidien)
+6. [Journal d'audit](#journal-daudit)
+7. [Configuration](#configuration)
+8. [Outils MCP exposés](#outils-mcp-exposés)
+9. [Administration](#administration)
+10. [Dépannage](#dépannage)
+11. [Sécurité](#sécurité)
+12. [Développement](#développement)
 
 ## Prérequis
 
@@ -131,7 +146,85 @@ hermes gateway restart
 fermés au redémarrage.
 
 **Désinstallation** : `sudo /usr/local/src/hermes-ngrok-mcp/deploy/uninstall.sh`, avec
-`--purge` pour supprimer aussi la configuration, le secret MFA et l'utilisateur.
+`--purge` pour supprimer aussi la configuration, le secret MFA, les journaux d'audit et les
+utilisateurs. Le dossier du NAS et son contenu ne sont jamais supprimés.
+
+## Gestionnaire de fichiers NAS
+
+```
+Toi ──► Hermes « ouvre le NAS » + code MFA ──► hermes-ngrok-mcp ──► tunnel HTTPS (plan gratuit)
+                                                     │ remet l'identifiant          │
+                                                     │ et le mot de passe du tunnel │
+                                                     ▼                              ▼
+                       hermes-nas (127.0.0.1:8766, sans réseau) : vérifie le mot de passe ──► /var/MonNAS
+```
+
+Le NAS est une application web servie par le service **`hermes-nas`**, distinct du serveur MCP :
+
+- utilisateur système dédié `hermes-nas`, qui ne peut écrire **que** dans le dossier partagé ;
+- démarrage à la demande par systemd (socket sur `127.0.0.1` uniquement) et arrêt automatique
+  après 10 min sans requête ; le processus n'a **aucun accès réseau** (`PrivateNetwork=yes`) ;
+- **le NAS vérifie lui-même** l'identifiant et le mot de passe générés pour le tunnel : le
+  serveur MCP les lui remet à l'ouverture (et te les envoie sur Telegram, jamais à Hermes), puis
+  les révoque à la fermeture. Ni un autre programme local ni Hermes ne peuvent donc lire le NAS
+  sans passer par `nas_open` et ton code MFA. Fonctionne sur le **plan ngrok gratuit** (aucune
+  Traffic Policy) ;
+- protection contre le brute-force : chaque mot de passe faux est consigné avec l'IP du client,
+  et après 20 échecs en 5 min le NAS refuse toute connexion pendant 15 min (une nouvelle
+  ouverture lève le blocage) ;
+- navigation, envoi (barre de progression, plusieurs fichiers ou dossiers entiers par
+  glisser-déposer, 10 Gio par fichier par défaut), téléchargement (avec reprise), création de
+  dossiers, aperçu des images, vidéos, sons et textes ;
+- **aucun écrasement ni suppression** : un fichier envoyé sous un nom déjà pris devient
+  `photo (1).jpg` ; les liens symboliques ne sont jamais suivis ;
+- chaque envoi, téléchargement, création de dossier et accès refusé est consigné avec l'IP du
+  client (`sudo hermes-ngrok-admin nas audit`).
+
+### Installation du NAS (root, une fois)
+
+Exemple avec le dossier `/var/MonNAS`, appartenant à l'utilisateur `aquadrox` :
+
+```bash
+# 1. Outil de gestion des ACL (droits partagés entre toi et le service)
+sudo apt install acl
+
+# 2. Relancer l'installeur avec le dossier du NAS (et, comme d'habitude, --hermes-user si tu l'utilises)
+sudo /usr/local/src/hermes-ngrok-mcp/deploy/install.sh --nas-dir /var/MonNAS --nas-owner aquadrox
+
+# 3. Vérifier
+sudo hermes-ngrok-admin nas check
+systemctl status hermes-nas.socket
+```
+
+L'installeur :
+
+1. crée l'utilisateur système **`hermes-nas`** (sans shell ni répertoire personnel) :
+   `useradd --system --user-group --no-create-home --home-dir /var/lib/hermes-nas --shell /usr/sbin/nologin hermes-nas` ;
+2. règle les droits du dossier :
+   - `chown aquadrox:hermes-nas /var/MonNAS` et `chmod 2770` : toi et le service, personne d'autre
+     (le bit setgid fait hériter le groupe aux nouveaux fichiers) ;
+   - ACL `u:aquadrox:rwX` et `g:hermes-nas:rwX`, plus les mêmes **ACL par défaut** sur chaque
+     dossier, pour que vous gardiez tous les deux l'accès à ce que l'autre crée, quel que soit
+     l'`umask` ;
+3. crée `/etc/hermes-nas/hermes-nas.env` (root:hermes-nas, 0640) et génère la **clé
+   d'administration** partagée avec le serveur MCP (`HERMES_NAS_ACCESS_KEY` =
+   `HERMES_NGROK_NAS_ACCESS_KEY`) : elle ne sert qu'à la santé du NAS et à la remise des
+   identifiants, jamais à lire des fichiers ;
+4. installe `hermes-nas.socket` et `hermes-nas.service`, redémarre le serveur MCP et vérifie que
+   le NAS répond.
+
+Les relances suivantes de `install.sh` conservent le NAS sans repréciser `--nas-dir`.
+
+> Un fichier **déplacé** (`mv`) dans le NAS depuis un autre endroit garde ses anciens droits.
+> Préfère `cp`, ou rétablis les droits :
+> `sudo setfacl -R -P -m u:aquadrox:rwX,g:hermes-nas:rwX /var/MonNAS`
+
+### Utilisation
+
+« Ouvre le NAS » → Hermes demande ton code MFA → le bot t'envoie l'URL, l'identifiant et le mot
+de passe. C'est ensuite un tunnel comme les autres : il se ferme après 10 min sans activité
+(un envoi ou un téléchargement en cours compte comme activité), au plus tard après 20 min sauf
+prolongation (« prolonge le NAS » + un code). Raccourcis clavier dans l'interface : `?`.
 
 ## Configurer le MFA avec Proton Authenticator
 
@@ -164,6 +257,8 @@ QR code dans la console.
 | « Le tunnel est utilisé ? » | Connexions, octets, dernière activité, temps restant avant fermeture. |
 | *(alerte à 15 min)* « Prolonge le tunnel » | Hermes demande un nouveau code et ajoute 20 min. |
 | « Ferme le tunnel » / « ferme tout » | Fermeture immédiate, sans code. |
+| « Ouvre le NAS » | Hermes demande ton code MFA, ouvre le gestionnaire de fichiers ; le bot t'envoie l'accès. |
+| « Qui s'est connecté au tunnel aujourd'hui ? » | Journal d'audit : ouvertures, IP des clients, tentatives MFA. |
 
 Les notifications automatiques (accès, alerte avant expiration, fermeture pour inactivité ou
 expiration, alerte de sécurité) arrivent dans la même conversation Telegram, envoyées par le bot.
@@ -175,6 +270,37 @@ Bon à savoir :
 - Sur le plan gratuit, ngrok affiche une page d'avertissement au premier accès depuis un
   navigateur : clique sur « Visit Site ».
 - Le plan gratuit n'a qu'un domaine : un seul tunnel HTTP à la fois.
+
+## Journal d'audit
+
+Tout est consigné, en JSON Lines, dans des fichiers que Hermes ne peut ni lire ni modifier
+directement (rotation automatique : 10 Mo × 5 par défaut) :
+
+| Fichier | Contenu |
+|---|---|
+| `/var/lib/hermes-ngrok-mcp/audit.jsonl` | Tunnels (`tunnel.opened`, `tunnel.closed` avec durée, octets et IP clientes, `tunnel.extended`, `tunnel.open_failed`), chaque connexion (`connection.closed` : IP et port source, durée, octets), MFA (`mfa.verified`, `mfa.rejected` avec le motif et les essais restants, `mfa.locked`, enrôlements), appels d'outils (`mcp.tool_call` : outil, résultat, durée, arguments **sans** code MFA), requêtes MCP sans jeton valide (`mcp.auth_rejected`), démarrages et arrêts. |
+| `/var/lib/hermes-nas/audit.jsonl` | NAS : `nas.upload`, `nas.download`, `nas.mkdir`, `nas.upload_failed`, `nas.access_denied`, démarrages et arrêts. |
+
+```bash
+sudo hermes-ngrok-admin audit --since 24h                 # tout, lisible
+sudo hermes-ngrok-admin audit --since 7d --summary        # compteurs + IP clientes
+sudo hermes-ngrok-admin audit --category mfa --since 30d  # tentatives MFA
+sudo hermes-ngrok-admin audit --json | jq .               # brut
+sudo hermes-ngrok-admin nas audit --since 7d              # activité du NAS
+```
+
+Chaque événement est aussi écrit dans journald (`journalctl -u hermes-ngrok-mcp | grep AUDIT`).
+Hermes peut consulter le journal du serveur MCP avec l'outil `audit_log` (lecture seule).
+
+Adresses IP des clients :
+
+- **NAS** : chaque requête porte l'IP du client (en-tête `X-Forwarded-For` ajouté par ngrok,
+  y compris sur le plan gratuit), et les **mots de passe faux** sont consignés
+  (`nas.auth_failed`, `nas.auth_locked`).
+- **Autres tunnels** : l'IP de chaque connexion n'est connue qu'avec le PROXY protocol de ngrok,
+  **réservé aux plans payants** (`HERMES_NGROK_PROXY_PROTOCOL=true`, sinon `ERR_NGROK_9014`).
+  Sans lui, les connexions sont consignées sans leur origine. Les mots de passe faux sur leur
+  basic auth sont bloqués par ngrok et n'arrivent pas jusqu'au serveur.
 
 ## Configuration
 
@@ -204,6 +330,15 @@ Fichier : `/etc/hermes-ngrok-mcp/hermes-ngrok-mcp.env`. Après modification :
 | `HERMES_NGROK_HOST` / `HERMES_NGROK_PORT` | `127.0.0.1` / `8765` | Écoute du serveur MCP. |
 | `HERMES_NGROK_API_TOKEN` | généré | Jeton Bearer attendu de Hermes. |
 | `HERMES_NGROK_LANGUAGE` / `HERMES_NGROK_TIMEZONE` | `fr` / `UTC` | Langue et fuseau des notifications. |
+| `HERMES_NGROK_PROXY_PROTOCOL` | `false` | IP réelle des clients de chaque tunnel (PROXY protocol, plan ngrok payant). |
+| `HERMES_NGROK_AUDIT_MAX_BYTES` / `_AUDIT_BACKUPS` | `10485760` / `5` | Rotation du journal d'audit. |
+| `HERMES_NGROK_NAS_PORT` | `8766` | Port local du NAS (réglé par l'installeur). |
+| `HERMES_NGROK_NAS_ACCESS_KEY` | généré | Clé partagée avec `hermes-nas` ; vide = NAS désactivé. |
+
+Le NAS a son propre fichier, `/etc/hermes-nas/hermes-nas.env`
+([modèle](deploy/hermes-nas.env.example)) : `HERMES_NAS_ROOT`, `HERMES_NAS_TITLE`,
+`HERMES_NAS_MAX_UPLOAD` (`10G`), `HERMES_NAS_IDLE_EXIT` (`10m`)… Après modification :
+`sudo systemctl restart hermes-nas`.
 
 ## Outils MCP exposés
 
@@ -218,6 +353,12 @@ Dans Hermes, ils apparaissent sous le nom `mcp_ngrok_<outil>`.
 | `tunnel_status` | Tunnels ouverts, usage, délais ; `verify=true` les reteste depuis Internet. | non |
 | `tunnel_extend` | Prolonge un tunnel et remet à zéro son minuteur d'inactivité. | **oui** |
 | `tunnel_close` | Ferme un tunnel ou tous. | non |
+| `nas_status` | NAS installé, joignable, espace libre, tunnel ouvert. | non |
+| `nas_open` | Ouvre le gestionnaire de fichiers NAS (tunnel HTTP toujours protégé). | **oui** |
+| `audit_log` | Journal d'audit et compteurs (`since`, `category`, `limit`). | non |
+
+Chaque appel d'outil est journalisé (résultat, durée). Les erreurs inattendues sont renvoyées à
+Hermes sous forme d'erreur propre (`isError`), avec les détails dans journald.
 
 ## Administration
 
@@ -227,8 +368,13 @@ sudo hermes-ngrok-admin mfa status     # état du MFA
 sudo hermes-ngrok-admin mfa setup      # enrôlement depuis le terminal
 sudo hermes-ngrok-admin mfa reset      # réinitialisation (téléphone perdu)
 sudo hermes-ngrok-admin notify-test    # test Telegram
+sudo hermes-ngrok-admin audit          # journal d'audit (voir plus haut)
+sudo hermes-ngrok-admin nas check      # NAS : configuration et droits du dossier
+sudo hermes-ngrok-admin nas audit      # NAS : envois, téléchargements, refus
 journalctl -u hermes-ngrok-mcp -f      # journaux (ouvertures, fermetures, échecs MFA)
+journalctl -u hermes-nas -f            # journaux du NAS (une ligne par requête)
 systemd-analyze security hermes-ngrok-mcp
+systemd-analyze security hermes-nas
 ```
 
 ## Dépannage
@@ -247,6 +393,14 @@ systemd-analyze security hermes-ngrok-mcp
 | « could not be verified » | Le VPS n'arrive pas à joindre sa propre URL publique (pare-feu sortant ?). En dernier recours : `HERMES_NGROK_VERIFY_TUNNELS=false`. |
 | Pas de notification Telegram | `sudo hermes-ngrok-admin notify-test`, puis vérifie `TELEGRAM_CHAT_ID` (ton identifiant numérique). |
 | Hermes passe par un proxy HTTP | Ajoute `127.0.0.1` à `NO_PROXY` dans l'environnement de Hermes. |
+| `nas_open` : « The NAS service is not working » | `systemctl status hermes-nas.socket hermes-nas`, `journalctl -u hermes-nas -n 50`, `sudo hermes-ngrok-admin nas check`. |
+| NAS : « the NAS refused the access key » | Les clés diffèrent entre les deux fichiers `.env` : relance `install.sh`. |
+| NAS : « Permission refusée » sur un dossier | Fichiers déplacés avec `mv` : rétablis les ACL (voir [Installation du NAS](#installation-du-nas-root-une-fois)). |
+| NAS : « Le tunnel du NAS est fermé » | Aucun tunnel NAS ouvert (ou il vient d'expirer) : demande à Hermes de rouvrir le NAS. |
+| Audit : `source_ip` absent sur `connection.closed` | Normal sur le plan ngrok gratuit (PROXY protocol payant). Le NAS, lui, consigne l'IP de chaque requête. |
+| `ERR_NGROK_9014` | PROXY protocol activé sur un plan gratuit : `HERMES_NGROK_PROXY_PROTOCOL=false`. |
+| `ERR_NGROK_2263` | Traffic Policy avec une action payante (versions ≤ 1.1.0 pour le NAS) : mets à jour. |
+| NAS : « Trop de mots de passe erronés » | 20 échecs en 5 min : attends 15 min, ou ferme et rouvre le NAS (nouveaux identifiants). |
 
 ## Sécurité
 
@@ -264,6 +418,13 @@ Le résumé ci-dessous est détaillé dans [SECURITY.md](SECURITY.md).
   ne peut jamais être exposé.
 - Le service tourne dans un bac à sable systemd : pas de privilèges, système de fichiers en
   lecture seule, appels système filtrés.
+- Le NAS est un service séparé, sous son propre utilisateur, sans réseau, qui ne peut écrire que
+  dans le dossier partagé. Il vérifie lui-même le mot de passe du tunnel (révoqué à la
+  fermeture, limité contre le brute-force) ; il bloque les écritures cross-site (en-tête anti-falsification),
+  ne sert jamais un fichier HTML ou SVG dans son origine (téléchargement forcé, CSP `sandbox`)
+  et n'écrase ni ne supprime rien.
+- Le journal d'audit est hors de portée de l'agent (lecture seule via `audit_log`) et ne contient
+  aucun secret.
 
 ## Développement
 
@@ -272,6 +433,7 @@ uv sync                 # dépendances (versions figées par uv.lock)
 make check              # ruff + mypy --strict + pytest
 make lock               # après un changement de dépendances (uv.lock + deploy/requirements.lock)
 uv run hermes-ngrok-mcp --env-file dev.env serve --transport stdio   # test local avec un client MCP
+uv run hermes-nas --env-file nas.env serve   # NAS sur 127.0.0.1:8766 (identifiants via PUT /api/admin/credentials)
 ```
 
 Architecture (`src/hermes_ngrok_mcp/`) :
@@ -285,9 +447,16 @@ Architecture (`src/hermes_ngrok_mcp/`) :
 | `tunnels/manager.py` | Cycle de vie : contrôles, ouverture, inactivité, expiration, prolongation. |
 | `tunnels/proxy.py` | Relais TCP local qui mesure l'usage réel. |
 | `tunnels/probe.py` | Vérification de bout en bout via l'URL publique. |
-| `tunnels/backends.py` | SDK ngrok (session partagée, Traffic Policy basic-auth). |
+| `tunnels/backends.py` | SDK ngrok (session partagée, Traffic Policy basic-auth et en-têtes). |
+| `tunnels/proxy_protocol.py` | Lecture des en-têtes PROXY v1/v2 (IP réelle des clients). |
+| `audit.py` | Journal d'audit JSON Lines (rotation, requêtes, synthèse). |
 | `notify.py`, `messages.py` | Notifications Telegram (FR/EN). |
 | `config.py`, `cli.py` | Configuration et ligne de commande. |
+| `nas/fs.py` | Accès confiné au dossier du NAS (`O_NOFOLLOW` à chaque niveau, envoi atomique). |
+| `nas/app.py`, `nas/static/` | Application web du NAS (Starlette) et son interface (HTML/CSS/JS sans dépendance). |
+| `nas/cli.py`, `nas/config.py` | Commande `hermes-nas` (activation par socket systemd, arrêt sur inactivité). |
+| `nas/client.py` | Appels du serveur MCP au NAS : santé, remise et révocation des identifiants. |
+| `nas/sessions.py` | Identifiants du tunnel NAS (empreinte SHA-256 persistée), anti brute-force. |
 
 Les tests (`tests/`) n'ont besoin ni de compte ngrok ni de Telegram : un faux « edge » ngrok
 local, une horloge simulée et un notificateur factice couvrent tout le cycle de vie.

@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f5f6fa" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0c0f15" media="(prefers-color-scheme: dark)">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{{TITLE}}</title>
+  <link rel="icon" href="/assets/icon.svg?v={{VERSION}}" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/app.css?v={{VERSION}}">
+  <script src="/assets/app.js?v={{VERSION}}" defer></script>
+</head>
+<body data-title="{{TITLE}}" data-max-upload="{{MAX_UPLOAD}}" data-version="{{VERSION}}">
+  <svg class="sprite" aria-hidden="true" focusable="false">
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h3.38a2 2 0 0 1 1.42.59L11.7 7H18.5A2.5 2.5 0 0 1 21 9.5v8a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z" fill="currentColor"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M7 3h7l5 5v11a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z" fill="currentColor" opacity=".18"/><path d="M14 3v4a1 1 0 0 0 1 1h4M7 3h7l5 5v11a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="9" cy="9.5" r="1.7" fill="currentColor"/><path d="m4.5 17 4.6-4.6a1.5 1.5 0 0 1 2.1 0L15 16.2l1.6-1.6a1.5 1.5 0 0 1 2.1 0l1.8 1.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></symbol>
+    <symbol id="i-video" viewBox="0 0 24 24"><rect x="3" y="5.5" width="13" height="13" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m16 10.2 4.2-2.5a.5.5 0 0 1 .8.43v7.74a.5.5 0 0 1-.8.43L16 13.8z" fill="currentColor"/></symbol>
+    <symbol id="i-audio" viewBox="0 0 24 24"><path d="M9 17.5V6.2a1 1 0 0 1 .76-.97l8-2A1 1 0 0 1 19 4.2v11.3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="6.5" cy="17.5" r="2.5" fill="currentColor"/><circle cx="16.5" cy="15.5" r="2.5" fill="currentColor"/></symbol>
+    <symbol id="i-archive" viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="5" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M5 9v9.5A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5V9M10 13h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+    <symbol id="i-doc" viewBox="0 0 24 24"><path d="M7 3h7l5 5v11a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M8.5 12.5h7M8.5 16h5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="m8.5 8-4 4 4 4M15.5 8l4 4-4 4M13.2 5.5l-2.4 13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+    <symbol id="i-home" viewBox="0 0 24 24"><path d="M4 10.5 12 4l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9.5 6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4.5M7.5 9 12 4.5 16.5 9M5 15.5V18a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-2.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11.5M7.5 11 12 15.5 16.5 11M5 18.5h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-folder-plus" viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h3.38a2 2 0 0 1 1.42.59L11.7 7H18.5A2.5 2.5 0 0 1 21 9.5v8a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M12 10.5v6M9 13.5h6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M8.5 6.5h11M8.5 12h11M8.5 17.5h11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="4.5" cy="6.5" r="1.2" fill="currentColor"/><circle cx="4.5" cy="12" r="1.2" fill="currentColor"/><circle cx="4.5" cy="17.5" r="1.2" fill="currentColor"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="4" y="4" width="6.5" height="6.5" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.5v2M12 19.5v2M4.6 4.6l1.4 1.4M18 18l1.4 1.4M2.5 12h2M19.5 12h2M4.6 19.4 6 18M18 6l1.4-1.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6.5 6.5 11 11M17.5 6.5l-11 11" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 7.5v5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="16.3" r="1.2" fill="currentColor"/></symbol>
+    <symbol id="i-retry" viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v4h-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-prev" viewBox="0 0 24 24"><path d="m14.5 6-6 6 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5.5M6.5 11 12 5.5l5.5 5.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="2.5" y="6" width="19" height="12" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M6 10h.01M9.5 10h.01M13 10h.01M16.5 10h.01M7.5 14h9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol>
+  </svg>
+
+  <header class="topbar">
+    <a class="brand" href="#/" aria-label="Accueil du NAS">
+      <img src="/assets/icon.svg?v={{VERSION}}" alt="" width="32" height="32">
+      <span class="brand-name">{{TITLE}}</span>
+    </a>
+    <label class="search" id="search-box">
+      <svg class="icon"><use href="#i-search"/></svg>
+      <input id="search" type="search" placeholder="Filtrer ce dossier" autocomplete="off" spellcheck="false" aria-label="Filtrer ce dossier">
+      <kbd class="hint">/</kbd>
+    </label>
+    <div class="actions">
+      <button class="icon-btn only-mobile" id="search-toggle" type="button" aria-label="Rechercher"><svg class="icon"><use href="#i-search"/></svg></button>
+      <button class="icon-btn" id="view-toggle" type="button" aria-label="Changer d'affichage" title="Affichage (V)"><svg class="icon"><use href="#i-grid"/></svg></button>
+      <button class="icon-btn" id="theme-toggle" type="button" aria-label="Changer de thème" title="Thème"><svg class="icon"><use href="#i-moon"/></svg></button>
+      <button class="btn btn-ghost" id="mkdir-btn" type="button" title="Nouveau dossier (N)"><svg class="icon"><use href="#i-folder-plus"/></svg><span class="label">Nouveau dossier</span></button>
+      <button class="btn btn-primary" id="upload-btn" type="button" title="Envoyer des fichiers (U)"><svg class="icon"><use href="#i-upload"/></svg><span class="label">Envoyer</span></button>
+      <input id="file-input" type="file" multiple hidden>
+    </div>
+  </header>
+
+  <div class="banner" id="banner" hidden role="alert">
+    <svg class="icon"><use href="#i-alert"/></svg><span id="banner-text"></span>
+    <button class="btn btn-small" id="banner-retry" type="button">Réessayer</button>
+  </div>
+
+  <main class="page" id="page">
+    <div class="toolbar">
+      <nav class="crumbs" id="crumbs" aria-label="Fil d'Ariane"></nav>
+      <div class="storage" id="storage" hidden>
+        <div class="storage-text" id="storage-text"></div>
+        <div class="meter" role="meter" aria-label="Espace utilisé" id="storage-meter"><span id="storage-bar"></span></div>
+      </div>
+    </div>
+
+    <section class="browser" id="browser" aria-live="polite">
+      <div class="list-head" id="list-head" role="row">
+        <button class="col col-name sortable" data-sort="name" type="button">Nom<span class="arrow"></span></button>
+        <button class="col col-size sortable" data-sort="size" type="button">Taille<span class="arrow"></span></button>
+        <button class="col col-date sortable" data-sort="modified" type="button">Modifié<span class="arrow"></span></button>
+        <span class="col col-act"></span>
+      </div>
+      <ul class="entries" id="entries" role="list"></ul>
+      <div class="empty" id="empty" hidden>
+        <div class="empty-art" aria-hidden="true">
+          <svg viewBox="0 0 120 96"><rect x="14" y="24" width="92" height="62" rx="12" class="ea-back"/><path d="M14 36a12 12 0 0 1 12-12h22l8 8h38a12 12 0 0 1 12 12v30a12 12 0 0 1-12 12H26a12 12 0 0 1-12-12z" class="ea-front"/><path d="M60 46v20M51 55l9-9 9 9" class="ea-arrow"/></svg>
+        </div>
+        <h2 id="empty-title">Ce dossier est vide</h2>
+        <p id="empty-text">Glissez des fichiers ici, ou utilisez le bouton <strong>Envoyer</strong>.</p>
+      </div>
+      <p class="footnote" id="footnote" hidden></p>
+    </section>
+  </main>
+
+  <div class="dropzone" id="dropzone" hidden>
+    <div class="dropzone-card">
+      <svg class="icon"><use href="#i-upload"/></svg>
+      <strong>Déposez pour envoyer</strong>
+      <span id="dropzone-target"></span>
+    </div>
+  </div>
+
+  <aside class="uploads" id="uploads" hidden aria-label="Envois">
+    <header class="uploads-head">
+      <div class="uploads-title"><strong id="uploads-title">Envois</strong><span id="uploads-sub"></span></div>
+      <button class="icon-btn small" id="uploads-clear" type="button" title="Effacer les envois terminés" aria-label="Effacer les envois terminés"><svg class="icon"><use href="#i-check"/></svg></button>
+      <button class="icon-btn small" id="uploads-collapse" type="button" aria-label="Réduire" aria-expanded="true"><svg class="icon"><use href="#i-chevron"/></svg></button>
+    </header>
+    <div class="uploads-total"><span id="uploads-bar"></span></div>
+    <ul class="uploads-list" id="uploads-list"></ul>
+  </aside>
+
+  <dialog class="modal" id="mkdir-dialog" aria-labelledby="mkdir-title">
+    <form method="dialog" id="mkdir-form" novalidate>
+      <h2 id="mkdir-title"><svg class="icon"><use href="#i-folder-plus"/></svg>Nouveau dossier</h2>
+      <p class="muted" id="mkdir-where"></p>
+      <label class="field">
+        <span>Nom</span>
+        <input id="mkdir-name" name="name" type="text" maxlength="255" autocomplete="off" spellcheck="false" required>
+      </label>
+      <p class="field-error" id="mkdir-error" role="alert"></p>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" type="button" id="mkdir-cancel">Annuler</button>
+        <button class="btn btn-primary" type="submit" id="mkdir-submit">Créer</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="viewer" id="viewer" aria-labelledby="viewer-name">
+    <header class="viewer-head">
+      <div class="viewer-title"><strong id="viewer-name"></strong><span id="viewer-meta"></span></div>
+      <a class="icon-btn" id="viewer-download" download aria-label="Télécharger" title="Télécharger"><svg class="icon"><use href="#i-download"/></svg></a>
+      <button class="icon-btn" id="viewer-close" type="button" aria-label="Fermer" title="Fermer (Échap)"><svg class="icon"><use href="#i-close"/></svg></button>
+    </header>
+    <div class="viewer-stage" id="viewer-stage"></div>
+    <button class="viewer-nav prev" id="viewer-prev" type="button" aria-label="Précédent"><svg class="icon"><use href="#i-prev"/></svg></button>
+    <button class="viewer-nav next" id="viewer-next" type="button" aria-label="Suivant"><svg class="icon"><use href="#i-chevron"/></svg></button>
+  </dialog>
+
+  <dialog class="modal" id="help-dialog" aria-labelledby="help-title">
+    <form method="dialog">
+      <h2 id="help-title"><svg class="icon"><use href="#i-keyboard"/></svg>Raccourcis clavier</h2>
+      <dl class="shortcuts">
+        <dt><kbd>/</kbd></dt><dd>Filtrer le dossier</dd>
+        <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>Se déplacer</dd>
+        <dt><kbd>Entrée</kbd></dt><dd>Ouvrir / aperçu</dd>
+        <dt><kbd>⌫</kbd></dt><dd>Dossier parent</dd>
+        <dt><kbd>U</kbd></dt><dd>Envoyer des fichiers</dd>
+        <dt><kbd>N</kbd></dt><dd>Nouveau dossier</dd>
+        <dt><kbd>V</kbd></dt><dd>Liste / grille</dd>
+        <dt><kbd>D</kbd></dt><dd>Télécharger la sélection</dd>
+        <dt><kbd>?</kbd></dt><dd>Cette aide</dd>
+      </dl>
+      <div class="modal-actions"><button class="btn btn-primary" type="submit">Fermer</button></div>
+    </form>
+  </dialog>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+
+  <footer class="foot">
+    <span><svg class="icon"><use href="#i-lock"/></svg>Accès protégé par Hermes · MFA</span>
+    <button class="linkish" id="help-btn" type="button">Raccourcis <kbd>?</kbd></button>
+  </footer>
+</body>
+</html>

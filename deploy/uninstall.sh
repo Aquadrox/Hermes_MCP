@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Remove the hermes-ngrok-mcp service. Configuration, MFA state and the service user are kept
-# unless --purge is given.
+# Remove the hermes-ngrok-mcp service (and the hermes-nas file manager, if installed).
+# Configuration, MFA state, audit trails and the service users are kept unless --purge is given.
+# The NAS folder itself and its content are NEVER deleted.
 set -Eeuo pipefail
 
 readonly APP=hermes-ngrok-mcp
@@ -29,17 +30,25 @@ if systemctl list-unit-files "$APP.service" >/dev/null 2>&1; then
     systemctl disable --now "$APP.service" 2>/dev/null || true
 fi
 rm -f "/etc/systemd/system/$APP.service" /usr/local/bin/hermes-ngrok-admin
+if [[ -f /etc/systemd/system/hermes-nas.socket || -f /etc/systemd/system/hermes-nas.service ]]; then
+    systemctl disable --now hermes-nas.socket hermes-nas.service 2>/dev/null || true
+    rm -f /etc/systemd/system/hermes-nas.socket /etc/systemd/system/hermes-nas.service
+    echo "NAS file manager removed (the shared folder and its files are untouched)."
+fi
 systemctl daemon-reload
 rm -rf /opt/hermes-ngrok-mcp
 echo "Service and application removed."
 
 if [[ $PURGE -eq 1 ]]; then
-    rm -rf /etc/hermes-ngrok-mcp /var/lib/hermes-ngrok-mcp
-    if id -u "$SERVICE_USER" >/dev/null 2>&1; then
-        userdel "$SERVICE_USER"
-    fi
-    echo "Configuration, MFA state and the $SERVICE_USER user removed."
+    rm -rf /etc/hermes-ngrok-mcp /var/lib/hermes-ngrok-mcp /etc/hermes-nas /var/lib/hermes-nas
+    for user in "$SERVICE_USER" hermes-nas; do
+        if id -u "$user" >/dev/null 2>&1; then
+            userdel "$user"
+        fi
+    done
+    echo "Configuration, MFA state, audit trails and the service users removed."
+    echo "The NAS folder keeps its ACLs; remove them if you like with: sudo setfacl -R -b <folder>"
     echo "Remember to remove the 'ngrok' entry from ~/.hermes/config.yaml and HERMES_NGROK_MCP_TOKEN from ~/.hermes/.env."
 else
-    echo "Kept /etc/hermes-ngrok-mcp and /var/lib/hermes-ngrok-mcp (use --purge to delete them)."
+    echo "Kept /etc/hermes-ngrok-mcp, /var/lib/hermes-ngrok-mcp, /etc/hermes-nas and /var/lib/hermes-nas (use --purge to delete them)."
 fi

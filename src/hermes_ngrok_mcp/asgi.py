@@ -10,6 +10,7 @@ from mcp.server.mcpserver import MCPServer
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from hermes_ngrok_mcp.audit import AuditLog
 from hermes_ngrok_mcp.config import Settings
 
 log = logging.getLogger(__name__)
@@ -33,18 +34,28 @@ class HealthCheckMiddleware:
 class BearerTokenMiddleware:
     """Reject every HTTP request lacking ``Authorization: Bearer <token>``."""
 
-    def __init__(self, app: ASGIApp, token: str) -> None:
+    def __init__(self, app: ASGIApp, token: str, *, audit: AuditLog | None = None) -> None:
         if len(token) < 32:
             raise ValueError("the API token must be at least 32 characters long")
         self._app = app
         self._token = token.encode()
+        self._audit = audit
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or self._authorized(scope):
             await self._app(scope, receive, send)
             return
         client = scope.get("client")
-        log.warning("rejected unauthenticated request from %s", client[0] if client else "unknown")
+        source = client[0] if client else "unknown"
+        log.warning("rejected unauthenticated request from %s", source)
+        if self._audit is not None:
+            self._audit.record(
+                "mcp.auth_rejected",
+                source_ip=source,
+                method=scope.get("method"),
+                path=scope.get("path"),
+                had_credentials=any(name == b"authorization" for name, _ in scope.get("headers", [])),
+            )
         body = json.dumps({"error": "unauthorized"}).encode()
         await send(
             {
@@ -69,7 +80,9 @@ class BearerTokenMiddleware:
         return hmac.compare_digest(credential.strip(), self._token)
 
 
-def build_http_app(server: MCPServer, settings: Settings, *, require_token: bool = True) -> ASGIApp:
+def build_http_app(
+    server: MCPServer, settings: Settings, *, require_token: bool = True, audit: AuditLog | None = None
+) -> ASGIApp:
     app: ASGIApp = server.streamable_http_app(
         streamable_http_path=settings.path,
         stateless_http=True,
@@ -84,4 +97,6 @@ def build_http_app(server: MCPServer, settings: Settings, *, require_token: bool
             )
         log.warning("HTTP transport running WITHOUT authentication (development mode)")
         return HealthCheckMiddleware(app)
-    return HealthCheckMiddleware(BearerTokenMiddleware(app, settings.api_token.get_secret_value()))
+    return HealthCheckMiddleware(
+        BearerTokenMiddleware(app, settings.api_token.get_secret_value(), audit=audit)
+    )
