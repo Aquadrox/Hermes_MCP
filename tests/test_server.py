@@ -34,6 +34,9 @@ EXPECTED_TOOLS = {
     "tunnel_status",
     "tunnel_extend",
     "tunnel_close",
+    "nas_status",
+    "nas_open",
+    "audit_log",
 }
 
 

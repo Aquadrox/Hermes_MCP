@@ -8,6 +8,8 @@ Lifecycle rules (all configurable):
   requiring a fresh MFA code (checked by the caller) and adding ``extension`` seconds;
 * the user is warned on Telegram ``expiry_warning`` seconds before the hard expiry, and
   told when a tunnel is closed automatically.
+
+Every opening, failure, extension, closing and client connection is recorded in the audit trail.
 """
 
 from __future__ import annotations
@@ -20,7 +22,9 @@ import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal, Protocol
 
+from hermes_ngrok_mcp.audit import AuditLog
 from hermes_ngrok_mcp.clock import Clock
 from hermes_ngrok_mcp.config import Settings
 from hermes_ngrok_mcp.messages import Messages, TunnelFacts
@@ -34,7 +38,7 @@ from hermes_ngrok_mcp.tunnels.backends import (
     basic_auth_policy,
 )
 from hermes_ngrok_mcp.tunnels.probe import VerificationResult, verify_endpoint
-from hermes_ngrok_mcp.tunnels.proxy import ActivityProxy, UsageStats
+from hermes_ngrok_mcp.tunnels.proxy import ActivityProxy, ConnectionRecord, UsageStats
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +46,26 @@ Verifier = Callable[..., Awaitable[VerificationResult]]
 
 # A tunnel counts as "in use" when it carried traffic during the last minute.
 _IN_USE_WINDOW = 60.0
+_AUDITED_SOURCES = 20
+
+# "nas": the hermes-nas file manager, opened by nas_open only and always password-protected.
+TunnelKind = Literal["generic", "nas"]
+
+
+class UpstreamAuth(Protocol):
+    """A service that checks a tunnel's credentials itself, instead of the ngrok edge.
+
+    Used for the NAS: on the free ngrok plan a Traffic Policy can only do basic auth, so the
+    NAS enforces the generated credentials and nothing reaches it without them.
+    """
+
+    async def grant(self, username: str, password: str) -> None:
+        """Accept these credentials (replacing any previous ones). Raises on failure."""
+        ...
+
+    async def revoke(self) -> None:
+        """Forget every credential. Raises on failure."""
+        ...
 
 
 class CloseReason(StrEnum):
@@ -78,6 +102,7 @@ class _Tunnel:
     proxy: ActivityProxy
     endpoint: Endpoint
     verification: VerificationResult | None
+    kind: TunnelKind = "generic"
     extensions: int = 0
     warned: bool = False
     credentials_sent_to_user: bool = False
@@ -106,6 +131,7 @@ class TunnelView:
     usage: UsageStats
     verification: VerificationResult | None
     closed_reason: str | None = None
+    kind: TunnelKind = "generic"
 
 
 class TunnelManager:
@@ -119,6 +145,9 @@ class TunnelManager:
         messages: Messages,
         verifier: Verifier = verify_endpoint,
         reserved_ports: frozenset[int] = frozenset(),
+        nas_port: int | None = None,
+        nas_auth: UpstreamAuth | None = None,
+        audit: AuditLog | None = None,
     ) -> None:
         self._settings = settings
         self._backend = backend
@@ -127,6 +156,9 @@ class TunnelManager:
         self._messages = messages
         self._verifier = verifier
         self._reserved_ports = reserved_ports
+        self._nas_port = nas_port
+        self._nas_auth = nas_auth
+        self._audit = audit or AuditLog(None, clock=clock, tz=settings.tz)
         self._tunnels: dict[str, _Tunnel] = {}
         self._lock = asyncio.Lock()
         self._reaper: asyncio.Task[None] | None = None
@@ -135,6 +167,8 @@ class TunnelManager:
     async def start(self) -> None:
         if self._reaper is None:
             self._reaper = asyncio.create_task(self._reap_forever(), name="tunnel-reaper")
+        # No NAS tunnel survives a restart: drop credentials a crash may have left behind.
+        await self._revoke_nas("startup")
 
     async def aclose(self) -> None:
         reaper, self._reaper = self._reaper, None
@@ -149,9 +183,11 @@ class TunnelManager:
             await self._backend.aclose()
 
     # --- requests ------------------------------------------------------------------------------------
-    async def check_open(self, port: int, protocol: TunnelProtocol, protect: bool | None) -> None:
+    async def check_open(
+        self, port: int, protocol: TunnelProtocol, protect: bool | None, *, kind: TunnelKind = "generic"
+    ) -> None:
         """Refuse early (before an MFA code is consumed) a request that cannot succeed."""
-        self._check_open_policy(port, protocol, protect)
+        self._check_open_policy(port, protocol, protect, kind)
         if not await self._target_listening(port):
             raise TunnelError(
                 f"Nothing is listening on {self._settings.target_host}:{port}. "
@@ -165,30 +201,47 @@ class TunnelManager:
         *,
         protect: bool | None = None,
         label: str | None = None,
+        kind: TunnelKind = "generic",
     ) -> TunnelView:
+        """Open a tunnel. For ``kind="nas"`` the NAS itself checks the generated credentials."""
         async with self._lock:
-            backend = self._check_open_policy(port, protocol, protect)
+            backend = self._check_open_policy(port, protocol, protect, kind)
+            nas_auth = self._nas_auth
+            if kind == "nas" and nas_auth is None:
+                raise TunnelError("The NAS is not configured on this server.")
             tunnel_id = self._new_id()
-            use_auth = protocol == "http" and (self._settings.basic_auth if protect is None else protect)
+            use_auth = protocol == "http" and (
+                kind == "nas" or (self._settings.basic_auth if protect is None else protect)
+            )
             credentials = (
                 Credentials(self._settings.basic_auth_user, secrets.token_urlsafe(18)) if use_auth else None
             )
-            proxy = ActivityProxy(self._settings.target_host, port, clock=self._clock)
+            proxy = ActivityProxy(
+                self._settings.target_host,
+                port,
+                clock=self._clock,
+                proxy_protocol=self._settings.proxy_protocol,
+                on_connection=lambda record: self._audit_connection(tunnel_id, record),
+            )
             await proxy.start()
             endpoint: Endpoint | None = None
             try:
+                if nas_auth is not None and kind == "nas" and credentials is not None:
+                    await self._grant_nas(nas_auth, credentials)
                 endpoint = await backend.open(
                     EndpointSpec(
                         protocol=protocol,
                         upstream=proxy.address,
+                        # The NAS enforces its credentials itself: no (paid) policy needed at the edge.
                         traffic_policy=(
                             basic_auth_policy(credentials.username, credentials.password)
-                            if credentials
+                            if credentials and kind != "nas"
                             else None
                         ),
                         domain=self._settings.domain if protocol == "http" else None,
-                        metadata=json.dumps({"tunnel_id": tunnel_id, "local_port": port}),
+                        metadata=json.dumps({"tunnel_id": tunnel_id, "local_port": port, "kind": kind}),
                         description=f"hermes-ngrok-mcp {tunnel_id} -> {self._settings.target_host}:{port}",
+                        proxy_protocol=self._settings.proxy_protocol,
                     )
                 )
                 verification = await self._verify_new(protocol, endpoint.url, proxy, credentials)
@@ -196,6 +249,15 @@ class TunnelManager:
                 if endpoint is not None:
                     await endpoint.close()
                 await proxy.aclose()
+                if kind == "nas":
+                    await self._revoke_nas("open_failed")
+                self._audit.record(
+                    "tunnel.open_failed",
+                    kind=kind,
+                    protocol=protocol,
+                    local_port=port,
+                    error=str(exc) if isinstance(exc, BackendError | TunnelError) else type(exc).__name__,
+                )
                 if isinstance(exc, BackendError):
                     raise TunnelError(f"ngrok refused to open the tunnel: {exc}") from exc
                 raise
@@ -213,8 +275,21 @@ class TunnelManager:
                 proxy=proxy,
                 endpoint=endpoint,
                 verification=verification,
+                kind=kind,
             )
             self._tunnels[tunnel_id] = tunnel
+        self._audit.record(
+            "tunnel.opened",
+            tunnel_id=tunnel_id,
+            kind=kind,
+            protocol=protocol,
+            local_port=port,
+            label=label,
+            public_url=tunnel.public_url,
+            basic_auth=credentials is not None,
+            verified=verification.ok if verification else None,
+            expires_in_seconds=max_lifetime or None,
+        )
         log.info(
             "tunnel opened id=%s protocol=%s port=%s url=%s basic_auth=%s",
             tunnel_id,
@@ -235,6 +310,7 @@ class TunnelManager:
             ):
                 # The password must reach the user through Telegram only. Failing closed also
                 # defeats an agent that would provoke the failure to get the password itself.
+                self._audit.record("tunnel.credentials_undeliverable", tunnel_id=tunnel_id)
                 async with self._lock:
                     if self._tunnels.get(tunnel_id) is tunnel:
                         await self._close_locked(tunnel, CloseReason.MANUAL)
@@ -280,6 +356,12 @@ class TunnelManager:
             tunnel.extensions += 1
             tunnel.warned = False
             tunnel.proxy.reset_idle_timer()
+        self._audit.record(
+            "tunnel.extended",
+            tunnel_id=tunnel_id,
+            by_seconds=self._settings.extension,
+            extensions=tunnel.extensions,
+        )
         log.info(
             "tunnel extended id=%s by=%ss extensions=%s",
             tunnel_id,
@@ -357,6 +439,9 @@ class TunnelManager:
                 if remaining <= warning:
                     tunnel.warned = True
                     log.info("tunnel expiry warning id=%s remaining=%.0fs", tunnel.id, remaining)
+                    self._audit.record(
+                        "tunnel.expiry_warning", tunnel_id=tunnel.id, remaining_seconds=round(remaining)
+                    )
                     if self._notifier.enabled:
                         await self._notifier.send_text(
                             self._messages.expiry_warning(self._facts(tunnel), remaining=remaining)
@@ -376,7 +461,9 @@ class TunnelManager:
         return tunnel.proxy.idle_for(now) >= self._settings.idle_timeout
 
     # --- internals --------------------------------------------------------------------------------------
-    def _check_open_policy(self, port: int, protocol: TunnelProtocol, protect: bool | None) -> TunnelBackend:
+    def _check_open_policy(
+        self, port: int, protocol: TunnelProtocol, protect: bool | None, kind: TunnelKind = "generic"
+    ) -> TunnelBackend:
         settings = self._settings
         if self._backend is None:
             raise TunnelError(
@@ -387,13 +474,7 @@ class TunnelManager:
             raise TunnelError("protocol must be 'http' or 'tcp'.")
         if not 1 <= port <= 65_535:
             raise TunnelError("port must be between 1 and 65535.")
-        if port in self._reserved_ports:
-            raise TunnelError(f"Port {port} is used by this MCP server itself and can never be exposed.")
-        if port not in settings.allowed_ports or port in settings.denied_ports:
-            raise TunnelError(
-                f"Port {port} is not allowed by the server policy (allowed: {settings.allowed_ports}; "
-                f"denied: {settings.denied_ports or 'none'})."
-            )
+        self._check_port_policy(port, protocol, protect, kind)
         if protocol == "tcp" and protect:
             raise TunnelError(
                 "Password protection is only available for HTTP tunnels. Retry without protect, "
@@ -412,6 +493,25 @@ class TunnelManager:
                 f"The maximum of {settings.max_tunnels} simultaneous tunnel(s) is reached; close one first."
             )
         return self._backend
+
+    def _check_port_policy(
+        self, port: int, protocol: TunnelProtocol, protect: bool | None, kind: TunnelKind
+    ) -> None:
+        settings = self._settings
+        if port in self._reserved_ports:
+            raise TunnelError(f"Port {port} is used by this MCP server itself and can never be exposed.")
+        if kind == "nas":
+            if port != self._nas_port or protocol != "http" or protect is False:
+                raise TunnelError(
+                    "The NAS is only exposed over a password-protected HTTP tunnel to its own port."
+                )
+        elif self._nas_port is not None and port == self._nas_port:
+            raise TunnelError(f"Port {port} is the NAS file manager: open it with nas_open, not tunnel_open.")
+        elif port not in settings.allowed_ports or port in settings.denied_ports:
+            raise TunnelError(
+                f"Port {port} is not allowed by the server policy (allowed: {settings.allowed_ports}; "
+                f"denied: {settings.denied_ports or 'none'})."
+            )
 
     async def _target_listening(self, port: int) -> bool:
         try:
@@ -446,8 +546,56 @@ class TunnelManager:
         except Exception:
             log.exception("closing endpoint of tunnel %s failed", tunnel.id)
         await tunnel.proxy.aclose()
+        if tunnel.kind == "nas":
+            await self._revoke_nas(reason.value)
         log.info("tunnel closed id=%s reason=%s", tunnel.id, reason.value)
+        usage = view.usage
+        self._audit.record(
+            "tunnel.closed",
+            tunnel_id=tunnel.id,
+            kind=tunnel.kind,
+            protocol=tunnel.protocol,
+            local_port=tunnel.local_port,
+            public_url=tunnel.public_url,
+            reason=reason.value,
+            lifetime_seconds=round(self._clock.time() - tunnel.opened_at),
+            extensions=tunnel.extensions,
+            connections_total=usage.connections_total,
+            bytes_in=usage.bytes_in,
+            bytes_out=usage.bytes_out,
+            sources=dict(tunnel.proxy.sources().most_common(_AUDITED_SOURCES)),
+        )
         return view
+
+    async def _grant_nas(self, nas_auth: UpstreamAuth, credentials: Credentials) -> None:
+        try:
+            await nas_auth.grant(credentials.username, credentials.password)
+        except Exception as exc:
+            log.warning("handing the credentials to the NAS failed: %s", exc)
+            raise TunnelError(
+                f"The NAS did not accept the tunnel credentials ({exc}), so nothing was exposed."
+            ) from exc
+
+    async def _revoke_nas(self, reason: str) -> None:
+        """Best effort: a tunnel must close even if the NAS is unreachable."""
+        if self._nas_auth is None:
+            return
+        try:
+            await self._nas_auth.revoke()
+        except Exception as exc:
+            log.warning("revoking the NAS credentials failed (%s): %s", reason, exc)
+            self._audit.record("nas.revoke_failed", reason=reason, error=str(exc)[:300])
+
+    def _audit_connection(self, tunnel_id: str, record: ConnectionRecord) -> None:
+        self._audit.record(
+            "connection.closed",
+            tunnel_id=tunnel_id,
+            source_ip=record.source.ip if record.source else None,
+            source_port=record.source.port if record.source else None,
+            duration_seconds=round(record.duration, 1),
+            bytes_in=record.bytes_in,
+            bytes_out=record.bytes_out,
+        )
 
     async def _notify_closed(self, view: TunnelView) -> None:
         if self._notifier.enabled and view.closed_reason:
@@ -516,4 +664,5 @@ class TunnelManager:
             usage=usage,
             verification=tunnel.verification,
             closed_reason=closed_reason,
+            kind=tunnel.kind,
         )

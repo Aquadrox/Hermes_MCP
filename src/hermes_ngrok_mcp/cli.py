@@ -7,6 +7,8 @@ Examples::
     hermes-ngrok-mcp check                      # validate the configuration
     hermes-ngrok-mcp mfa setup                  # enroll from a terminal (QR code printed)
     hermes-ngrok-mcp mfa reset                  # lost phone: forget the current secret
+    hermes-ngrok-mcp audit --since 24h          # audit trail: tunnels, MFA attempts, connections
+    hermes-ngrok-mcp audit --summary --since 7d # counters and client addresses
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import secrets
@@ -21,7 +24,7 @@ import signal
 import socket
 import stat
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -30,13 +33,14 @@ from pydantic import ValidationError
 
 from hermes_ngrok_mcp import __version__
 from hermes_ngrok_mcp.asgi import build_http_app
+from hermes_ngrok_mcp.audit import CATEGORIES, AuditLog, format_entry, summarize
 from hermes_ngrok_mcp.clock import SystemClock
 from hermes_ngrok_mcp.config import Settings, load_settings
-from hermes_ngrok_mcp.durations import format_duration
+from hermes_ngrok_mcp.durations import format_duration, parse_duration
 from hermes_ngrok_mcp.messages import Messages
 from hermes_ngrok_mcp.mfa import MfaError, MfaManager
 from hermes_ngrok_mcp.server import build_server
-from hermes_ngrok_mcp.services import build_notifier, open_services
+from hermes_ngrok_mcp.services import build_audit, build_notifier, open_services
 
 log = logging.getLogger("hermes_ngrok_mcp")
 
@@ -86,7 +90,54 @@ def _parser() -> argparse.ArgumentParser:
     setup.add_argument("--force", action="store_true", help="replace an existing secret without a code")
     reset = mfa_commands.add_parser("reset", help="forget the secret (e.g. lost phone)")
     reset.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+
+    audit = commands.add_parser("audit", help="show the audit trail (tunnels, MFA attempts, connections)")
+    add_audit_arguments(audit)
     return parser
+
+
+def add_audit_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--since", default="24h", help="how far back, e.g. 1h, 24h, 7d (0 = everything)")
+    parser.add_argument("--category", choices=sorted(CATEGORIES), default="all")
+    parser.add_argument("--limit", type=int, default=200, help="maximum number of events (0 = no limit)")
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true", help="print raw JSON lines")
+    output.add_argument("--summary", action="store_true", help="print counters and client addresses only")
+
+
+def print_audit(audit: AuditLog, args: argparse.Namespace, now: float) -> int:
+    try:
+        window = parse_duration(args.since)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    entries = audit.query(since=now - window if window else None, category=args.category, limit=args.limit)
+    if args.json:
+        for entry in entries:
+            print(json.dumps(entry, ensure_ascii=False))
+        return 0
+    if not args.summary:
+        for entry in entries:
+            print(format_entry(entry))
+        print()
+    summary = summarize(entries)
+    print(f"{summary.events} event(s) over {format_duration(window) if window else 'all time'}")
+    for label, value in (
+        ("tunnels opened / closed", f"{summary.tunnels_opened} / {summary.tunnels_closed}"),
+        ("tunnel open failures", summary.tunnel_open_failures),
+        ("MFA codes accepted / rejected", f"{summary.mfa_successes} / {summary.mfa_failures}"),
+        ("MFA lockouts", summary.mfa_lockouts),
+        ("MCP tool calls (errors)", f"{summary.mcp_tool_calls} ({summary.mcp_tool_errors})"),
+        ("MCP unauthenticated requests", summary.mcp_auth_rejections),
+        ("NAS requests refused (bad key)", summary.nas_access_denied),
+        ("client connections", summary.connections),
+    ):
+        print(f"  {label:<32} {value}")
+    if summary.sources:
+        print("  client addresses:")
+        for source, count in summary.top_sources(20):
+            print(f"    {source:<40} {count}")
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -100,13 +151,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Invalid configuration:\n{exc}", file=sys.stderr)
         return 2
     configure_logging(settings.log_level)
-    if args.command == "serve":
-        return _serve(settings, args)
-    if args.command == "check":
-        return _check(settings)
-    if args.command == "notify-test":
-        return asyncio.run(_notify_test(settings))
-    return _mfa(settings, args)
+    commands: dict[str, Callable[[], int]] = {
+        "serve": lambda: _serve(settings, args),
+        "check": lambda: _check(settings),
+        "notify-test": lambda: asyncio.run(_notify_test(settings)),
+        "audit": lambda: _audit(settings, args),
+        "mfa": lambda: _mfa(settings, args),
+    }
+    return commands[args.command]()
+
+
+def _audit(settings: Settings, args: argparse.Namespace) -> int:
+    clock = SystemClock()
+    return print_audit(build_audit(settings, clock, origin="admin-cli"), args, clock.time())
 
 
 # --- serve ---------------------------------------------------------------------------------------
@@ -146,7 +203,9 @@ def _serve(settings: Settings, args: argparse.Namespace) -> int:
 
 async def _serve_http(settings: Settings, *, require_token: bool) -> None:
     async with open_services(settings) as services:
-        app = build_http_app(build_server(services), settings, require_token=require_token)
+        app = build_http_app(
+            build_server(services), settings, require_token=require_token, audit=services.audit
+        )
         config = uvicorn.Config(
             app,
             host=settings.host,
@@ -204,7 +263,10 @@ def _check(settings: Settings) -> int:
     line("extension", format_duration(settings.extension))
     line("allowed / denied ports", f"{settings.allowed_ports} / {settings.denied_ports or '-'}")
     line("basic auth by default", settings.basic_auth)
+    line("PROXY protocol (client IPs)", settings.proxy_protocol)
+    line("NAS file manager", f"port {settings.nas_port}" if settings.nas_enabled else "off")
     line("state directory", settings.state_dir)
+    line("audit trail", settings.audit_file)
     try:
         mfa = MfaManager.from_settings(settings, SystemClock())
         status = mfa.status()
@@ -244,7 +306,8 @@ async def _notify_test(settings: Settings) -> int:
 
 # --- mfa -------------------------------------------------------------------------------------------------
 def _mfa(settings: Settings, args: argparse.Namespace) -> int:
-    mfa = MfaManager.from_settings(settings, SystemClock())
+    clock = SystemClock()
+    mfa = MfaManager.from_settings(settings, clock, build_audit(settings, clock, origin="admin-cli"))
     if args.mfa_command == "status":
         status = mfa.status()
         print(f"configured: {status.configured}")

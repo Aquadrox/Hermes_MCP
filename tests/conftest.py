@@ -15,8 +15,10 @@ import pytest
 
 from hermes_ngrok_mcp.config import Settings
 from hermes_ngrok_mcp.tunnels.backends import BackendError, EndpointSpec
+from hermes_ngrok_mcp.tunnels.proxy_protocol import encode_v2
 
 T0 = 1_800_000_000.0  # fixed wall-clock start, aligned on a 30 s TOTP step
+CLIENT_IP = "203.0.113.7"  # address the fake ngrok edge reports in its PROXY headers
 
 
 class FakeClock:
@@ -107,6 +109,8 @@ class FakeBackend:
         self.fail_with: str | None = None
         self.unreachable = False
         self.closed = False
+        self.client_ip = CLIENT_IP
+        self._client_port = 40_000
         self._tasks: set[asyncio.Task[Any]] = set()
 
     async def open(self, spec: EndpointSpec) -> _FakeEndpoint:
@@ -125,6 +129,9 @@ class FakeBackend:
             except OSError:
                 writer.close()
                 return
+            if spec.proxy_protocol:
+                self._client_port += 1
+                up_writer.write(encode_v2(self.client_ip, self._client_port))
 
             async def pump(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
                 with contextlib.suppress(OSError):
@@ -216,7 +223,10 @@ def anyio_backend() -> str:
 @pytest.fixture(autouse=True)
 def _isolated_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in list(os.environ):
-        if name.startswith(("HERMES_NGROK_", "TELEGRAM_", "NGROK_")) or name == "STATE_DIRECTORY":
+        if (
+            name.startswith(("HERMES_NGROK_", "HERMES_NAS_", "TELEGRAM_", "NGROK_"))
+            or name == "STATE_DIRECTORY"
+        ):
             monkeypatch.delenv(name, raising=False)
 
 

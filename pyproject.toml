@@ -1,7 +1,7 @@
 [project]
 name = "hermes-ngrok-mcp"
-version = "1.0.0"
-description = "MCP server that lets the Hermes agent open short-lived, TOTP-protected ngrok tunnels on demand."
+version = "1.1.1"
+description = "MCP server that lets the Hermes agent open short-lived, TOTP-protected ngrok tunnels on demand, with a NAS file manager."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
@@ -34,6 +34,7 @@ dependencies = [
 
 [project.scripts]
 hermes-ngrok-mcp = "hermes_ngrok_mcp.cli:main"
+hermes-nas = "hermes_ngrok_mcp.nas.cli:main"
 
 [project.urls]
 Source = "https://github.com/Aquadrox/Hermes_MCP"

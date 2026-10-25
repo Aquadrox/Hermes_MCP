@@ -1,0 +1,11 @@
+[Unit]
+Description=Hermes NAS file manager socket (loopback only; started on the first connection)
+Documentation=https://github.com/Aquadrox/Hermes_MCP
+
+[Socket]
+# @NAS_PORT@ is replaced by the installer (HERMES_NAS_PORT, default 8766).
+ListenStream=127.0.0.1:@NAS_PORT@
+NoDelay=yes
+
+[Install]
+WantedBy=sockets.target
